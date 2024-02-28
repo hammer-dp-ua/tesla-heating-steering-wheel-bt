@@ -29,6 +29,8 @@
 
 #include "smart_remote_keys.h"
 #include "tesla_steering_wheel.h"
+#include "ota.h"
+#include "beep.h"
 
 static const char *TAG = "TESLA_STEERING_WHEEL";
 
@@ -36,6 +38,8 @@ static bt_input_t bt_input;
 
 static TimerHandle_t scan_bt_timer;
 static TimerHandle_t temperature_read_timer;
+
+static const TaskHandle_t update_beep_task;
 
 static esp_hidh_dev_t *opened_bt_device = NULL;
 
@@ -59,35 +63,19 @@ bool read_flag(unsigned int flags, unsigned int flag) {
    return (flags & flag);
 }
 
-void beep_task(void *pvParameters)
-{
-    unsigned int beeps = (unsigned int) pvParameters;
-
-    if (beeps == LONG_BEEP) {
-        // Long beep
-        gpio_set_level(BUZZER_PIN, 1);
-        vTaskDelay(500 / portTICK_PERIOD_MS);
-        gpio_set_level(BUZZER_PIN, 0);
-    } else {
-        for (unsigned char i = 0; i < beeps; i++) {
-            gpio_set_level(BUZZER_PIN, 1);
-            vTaskDelay(100 / portTICK_PERIOD_MS);
-            gpio_set_level(BUZZER_PIN, 0);
-            vTaskDelay(100 / portTICK_PERIOD_MS);
-        }
-    }
-
-    vTaskDelete(NULL);
-}
-
-static void beep(unsigned int beeps)
-{
-    xTaskCreate(&beep_task, "beep_task", 1024, (void *) beeps, 2, NULL);
-}
-
 static void clear_bt_input()
 {
     bt_input = (bt_input_t) {};
+}
+
+void connect_wifi()
+{
+
+}
+
+static void update_software()
+{
+    infinite_beep(&update_beep_task);
 }
 
 static void increase_heating_temperature()
@@ -170,7 +158,7 @@ static void process_bt_input(esp_hidh_event_data_t *esp_hidh_event_data)
                     break;
                 }
                 case START_STOP_LONG_PRESS_BUTTON: {
-                    beep(LONG_BEEP);
+                    long_beep();
                     break;
                 }
                 case VOLUME_PLUS_BUTTON: {
@@ -224,8 +212,6 @@ static void process_bt_input(esp_hidh_event_data_t *esp_hidh_event_data)
             clear_bt_input();
         }
     }
-
-    //vTaskDelete(NULL);
 }
 
 static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
@@ -236,19 +222,20 @@ static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id,
     switch (event) {
         case ESP_HIDH_OPEN_EVENT: {
             if (param->open.status == ESP_OK) {
-                //const uint8_t *bda = esp_hidh_dev_bda_get(param->open.dev);
-                //ESP_LOGI(TAG, ESP_BD_ADDR_STR " OPEN: %s", ESP_BD_ADDR_HEX(bda), esp_hidh_dev_name_get(param->open.dev));
-                //esp_hidh_dev_dump(param->open.dev, stdout);
+                const uint8_t *bda = esp_hidh_dev_bda_get(param->open.dev);
+                ESP_LOGI(TAG, ESP_BD_ADDR_STR " OPEN: %s", ESP_BD_ADDR_HEX(bda), esp_hidh_dev_name_get(param->open.dev));
+                esp_hidh_dev_dump(param->open.dev, stdout);
+                
                 beep(3);
             } else {
-                //ESP_LOGE(TAG, " OPEN failed!");
+                ESP_LOGE(TAG, " OPEN failed!");
                 beep(10);
             }
             break;
         }
         case ESP_HIDH_BATTERY_EVENT: {
-            //const uint8_t *bda = esp_hidh_dev_bda_get(param->battery.dev);
-            //ESP_LOGI(TAG, ESP_BD_ADDR_STR " BATTERY: %d%%", ESP_BD_ADDR_HEX(bda), param->battery.level);
+            const uint8_t *bda = esp_hidh_dev_bda_get(param->battery.dev);
+            ESP_LOGI(TAG, ESP_BD_ADDR_STR " BATTERY: %d%%", ESP_BD_ADDR_HEX(bda), param->battery.level);
             break;
         }
         case ESP_HIDH_INPUT_EVENT: {
@@ -263,19 +250,20 @@ static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id,
         }
         case ESP_HIDH_FEATURE_EVENT: {
             const uint8_t *bda = esp_hidh_dev_bda_get(param->feature.dev);
-            /*ESP_LOGI(TAG, ESP_BD_ADDR_STR " FEATURE: %8s, MAP: %2u, ID: %3u, Len: %d", ESP_BD_ADDR_HEX(bda),
+
+            ESP_LOGI(TAG, ESP_BD_ADDR_STR " FEATURE: %8s, MAP: %2u, ID: %3u, Len: %d", ESP_BD_ADDR_HEX(bda),
                     esp_hid_usage_str(param->feature.usage), param->feature.map_index, param->feature.report_id,
                     param->feature.length);
-            ESP_LOG_BUFFER_HEX(TAG, param->feature.data, param->feature.length);*/
+            ESP_LOG_BUFFER_HEX(TAG, param->feature.data, param->feature.length);
             break;
         }
         case ESP_HIDH_CLOSE_EVENT: {
             const uint8_t *bda = esp_hidh_dev_bda_get(param->close.dev);
-            //ESP_LOGI(TAG, ESP_BD_ADDR_STR " CLOSE: %s", ESP_BD_ADDR_HEX(bda), esp_hidh_dev_name_get(param->close.dev));
+            ESP_LOGI(TAG, ESP_BD_ADDR_STR " CLOSE: %s", ESP_BD_ADDR_HEX(bda), esp_hidh_dev_name_get(param->close.dev));
             break;
         }
         default: {
-            //ESP_LOGI(TAG, "EVENT: %d", event);
+            ESP_LOGI(TAG, "EVENT: %d", event);
             break;
         }
     }
@@ -285,11 +273,6 @@ static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id,
 
 static void hid_scanning_task(void *pvParameters)
 {
-    if (esp_hidh_dev_exists(opened_bt_device)) {
-        vTaskDelete(NULL);
-        return;
-    }
-    
     size_t results_len = 0;
     esp_hid_scan_result_t *results = NULL;
 
@@ -352,9 +335,11 @@ static void hid_scanning_task(void *pvParameters)
 
 static void scan_bt(TimerHandle_t arg)
 {
-    xTaskCreate(&hid_scanning_task, "hid_scanning_task", 6 * 1024, NULL, 2, NULL);
+    if (!esp_hidh_dev_exists(opened_bt_device)) {
+        xTaskCreate(&hid_scanning_task, "hid_scanning", 4 * 1024, NULL, 2, NULL);
+    }
 }
-    
+
 static float calculate_ntc_temperature(float temp_sensor_resistance)
 {
     float temperature = temp_sensor_resistance / TEMPERATURE_SENSOR_NTC_R_NOMINAL;
@@ -437,7 +422,7 @@ static void read_temperature_task(void *pvParameters)
 static void read_temperature(TimerHandle_t arg)
 {
     if (read_flag(general_flags, STEERING_WHEEL_IS_TURNED_ON_FLAG)) {
-        xTaskCreate(&read_temperature_task, "read_temperature_task", 3 * 1024, NULL, 2, NULL);
+        xTaskCreate(&read_temperature_task, "read_temperature", 3 * 1024, NULL, 2, NULL);
     }
 }
 
@@ -452,11 +437,19 @@ static void pins_config()
     //bit mask of the pins that you want to set,e.g.GPIO18/19
     io_conf.pin_bit_mask = GPIO_OUTPUT_PIN_SEL;
     //disable pull-down mode
-    io_conf.pull_down_en = 0;
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     //disable pull-up mode
-    io_conf.pull_up_en = 0;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
     //configure GPIO with the given settings
     gpio_config(&io_conf);
+
+    gpio_config_t io_diag_conf = {};
+    io_diag_conf.intr_type = GPIO_INTR_DISABLE;
+    io_diag_conf.mode = GPIO_MODE_OUTPUT;
+    io_diag_conf.pin_bit_mask = (1ULL<<GPIO_OUTPUT_IO_DIAGNOSTIC);
+    io_diag_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_diag_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&io_diag_conf);
 }
 
 // ADC Calibration
@@ -532,6 +525,28 @@ static void adc_init()
     do_calibration_temperature_sensor = adc_calibration_init(ADC_UNIT_1, TEMPERATURE_SENSOR_ADC1_CHANNEL, ADC_ATTEN, &adc_cali_temperature_sensor_handle);
 }
 
+static void get_debug_task_info(char *task_name)
+{
+    TaskHandle_t xHandle = xTaskGetHandle(task_name);
+    configASSERT( xHandle );
+
+    TaskStatus_t xTaskDetails;
+    vTaskGetInfo(xHandle, &xTaskDetails, pdTRUE, eInvalid );
+    ESP_LOGI(TAG, "Task '%s'. Stack high water mark: %u. Task number: %u", xTaskDetails.pcTaskName, (unsigned int)xTaskDetails.usStackHighWaterMark, xTaskDetails.xTaskNumber);
+}
+
+static bool diagnostic(void)
+{
+    ESP_LOGI(TAG, "Diagnostics (5 sec)...");
+
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
+
+    bool diagnostic_is_ok = gpio_get_level(GPIO_OUTPUT_IO_DIAGNOSTIC);
+
+    gpio_reset_pin(GPIO_OUTPUT_IO_DIAGNOSTIC);
+    return diagnostic_is_ok;
+}
+
 void app_main(void)
 {
 #if HID_HOST_MODE == HIDH_IDLE_MODE
@@ -539,19 +554,61 @@ void app_main(void)
     return;
 #endif
 
+    uint8_t sha_256[HASH_LEN] = { 0 };
+    esp_partition_t partition;
+
+    // get sha256 digest for the partition table
+    partition.address   = ESP_PARTITION_TABLE_OFFSET;
+    partition.size      = ESP_PARTITION_TABLE_MAX_LEN;
+    partition.type      = ESP_PARTITION_TYPE_DATA;
+    esp_partition_get_sha256(&partition, sha_256);
+    print_sha256(sha_256, "SHA-256 for the partition table: ");
+
+    // get sha256 digest for bootloader
+    partition.address   = ESP_BOOTLOADER_OFFSET;
+    partition.size      = ESP_PARTITION_TABLE_OFFSET;
+    partition.type      = ESP_PARTITION_TYPE_APP;
+    esp_partition_get_sha256(&partition, sha_256);
+    print_sha256(sha_256, "SHA-256 for bootloader: ");
+
+    // get sha256 digest for running partition
+    esp_partition_get_sha256(esp_ota_get_running_partition(), sha_256);
+    print_sha256(sha_256, "SHA-256 for current firmware: ");
+
     pins_config();
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t ota_state;
+
+    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
+        if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+            // run diagnostic function ...
+            bool diagnostic_is_ok = diagnostic();
+
+            if (diagnostic_is_ok) {
+                ESP_LOGI(TAG, "Diagnostics completed successfully! Continuing execution ...");
+                esp_ota_mark_app_valid_cancel_rollback();
+                blocking_beep(2);
+            } else {
+                ESP_LOGE(TAG, "Diagnostics failed! Start rollback to the previous version ...");
+                esp_ota_mark_app_invalid_rollback_and_reboot();
+            }
+        }
+    }
+
+    // Initialize NVS.
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        // OTA app partition table has a smaller NVS partition size than the non-OTA
+        // partition table. This size mismatch may cause NVS initialization to fail.
+        // If this happens, we erase NVS partition and initialize NVS again.
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
 
     adc_init();
 
-    esp_err_t ret;
-
-    ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-
-    ESP_ERROR_CHECK( ret );
     ESP_LOGI(TAG, "setting hid gap, mode:%d", HID_HOST_MODE);
     ESP_ERROR_CHECK( esp_hid_gap_init(HID_HOST_MODE) );
 
@@ -560,8 +617,8 @@ void app_main(void)
 #endif /* CONFIG_BT_BLE_ENABLED */
 
     esp_hidh_config_t config = {
-        .callback = hidh_callback,
-        .event_stack_size = 5 * 1024,
+        .callback = hidh_callback, // "esp_ble_hidh_ev" task
+        .event_stack_size = 3 * 1024,
         .callback_arg = NULL,
     };
 
@@ -576,4 +633,11 @@ void app_main(void)
     int temperature_read_timer_tmr_id = 1;
     temperature_read_timer = xTimerCreate("temperature_read_timer", (2000 / portTICK_PERIOD_MS), pdTRUE, (void *) &temperature_read_timer_tmr_id, read_temperature);
     xTimerStart(temperature_read_timer, portMAX_DELAY);
+
+    /* while (1) {
+        get_debug_task_info("BTU_TASK");
+        get_debug_task_info("read_temperature");
+
+        vTaskDelay(5000 / portTICK_PERIOD_MS);
+    } */
 }

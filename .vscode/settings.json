@@ -25,6 +25,18 @@
     "string_view": "c",
     "esp_bt_device.h": "c",
     "gpio.h": "c",
-    "gpio_etm.h": "c"
+    "gpio_etm.h": "c",
+    "adc_oneshot.h": "c",
+    "smart_remote_keys.h": "c",
+    "tesla_steering_wheel.h": "c",
+    "event_groups.h": "c",
+    "stdio.h": "c",
+    "stdlib.h": "c",
+    "string.h": "c",
+    "math.h": "c",
+    "esp_app_format.h": "c",
+    "esp_partition.h": "c",
+    "freertos.h": "c",
+    "task.h": "c"
   }
 }
