@@ -24,11 +24,11 @@ static void http_cleanup(esp_http_client_handle_t client)
     esp_http_client_cleanup(client);
 }
 
-static void __attribute__((noreturn)) task_fatal_error(TaskHandle_t * const beep_task)
+static void task_fatal_error(TaskHandle_t * const beep_task)
 {
     ESP_LOGE(TAG, "Exiting task due to fatal error...");
 
-    vTaskDelete(beep_task);
+    vTaskDelete(*beep_task);
     turn_beeper_off();
 
     vTaskDelete(NULL);
@@ -223,7 +223,7 @@ void ota_task(void *pvParameter)
     ESP_LOGI(TAG, "Prepare to restart system!");
 
     vTaskDelete(*beep_task);
-    long_blocking_beep();
+    blocking_single_beep_ms(2000);
 
     esp_restart();
     return ;

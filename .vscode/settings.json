@@ -37,6 +37,7 @@
     "esp_app_format.h": "c",
     "esp_partition.h": "c",
     "freertos.h": "c",
-    "task.h": "c"
+    "task.h": "c",
+    "wifi.h": "c"
   }
 }

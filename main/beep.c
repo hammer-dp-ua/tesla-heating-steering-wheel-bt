@@ -9,24 +9,28 @@
 
 void blocking_beep(unsigned int beeps)
 {
-    if (beeps == LONG_BEEP) {
-        // Long beep
+    for (unsigned char i = 0; i < beeps; i++) {
         gpio_set_level(BUZZER_PIN, 1);
-        vTaskDelay(500 / portTICK_PERIOD_MS);
+        vTaskDelay(100 / portTICK_PERIOD_MS);
         gpio_set_level(BUZZER_PIN, 0);
-    } else {
-        for (unsigned char i = 0; i < beeps; i++) {
-            gpio_set_level(BUZZER_PIN, 1);
-            vTaskDelay(100 / portTICK_PERIOD_MS);
-            gpio_set_level(BUZZER_PIN, 0);
-            vTaskDelay(100 / portTICK_PERIOD_MS);
-        }
+        vTaskDelay(100 / portTICK_PERIOD_MS);
     }
 }
 
-void long_blocking_beep()
+void blocking_single_beep_ms(unsigned int duration_ms)
 {
-    blocking_beep(LONG_BEEP);
+    gpio_set_level(BUZZER_PIN, 1);
+    vTaskDelay(duration_ms / portTICK_PERIOD_MS);
+    gpio_set_level(BUZZER_PIN, 0);
+}
+
+static void blocking_single_beep_ms_task(void *pvParameters)
+{
+    unsigned int duration_ms = (unsigned int) pvParameters;
+
+    blocking_single_beep_ms(duration_ms);
+
+    vTaskDelete(NULL);
 }
 
 static void beep_task(void *pvParameters)
@@ -40,12 +44,12 @@ static void beep_task(void *pvParameters)
 
 void beep(unsigned int beeps)
 {
-    xTaskCreate(&beep_task, "beep_task", 1024, (void *) beeps, 2, NULL);
+    xTaskCreate(&beep_task, "beep", 1024, (void *) beeps, 2, NULL);
 }
 
-void long_beep()
+void single_beep_ms(unsigned int duration_ms)
 {
-    beep(LONG_BEEP);
+    xTaskCreate(&blocking_single_beep_ms_task, "blocking_single_beep_ms", 1024, (void *) duration_ms, 2, NULL);
 }
 
 static void infinite_beep_task(void *pvParameters)
@@ -65,14 +69,14 @@ static void infinite_beep_task(void *pvParameters)
     }
 }
 
-void infinite_beep(TaskHandle_t * const pxCreatedTask)
+void infinite_beep(TaskHandle_t * pxCreatedTask)
 {
-    xTaskCreate(&infinite_beep_task, "infinite_beep_task", 1024, (void *) INFINITE_BEEP, 2, pxCreatedTask);
+    xTaskCreate(&infinite_beep_task, "infinite_beep", 1024, (void *) INFINITE_BEEP, 2, pxCreatedTask);
 }
 
-void fast_infinite_beep(TaskHandle_t * const pxCreatedTask)
+void fast_infinite_beep(TaskHandle_t * pxCreatedTask)
 {
-    xTaskCreate(&infinite_beep_task, "infinite_beep_task", 1024, (void *) FAST_INFINITE_BEEP, 2, pxCreatedTask);
+    xTaskCreate(&infinite_beep_task, "infinite_beep", 1024, (void *) FAST_INFINITE_BEEP, 2, pxCreatedTask);
 }
 
 void turn_beeper_off()

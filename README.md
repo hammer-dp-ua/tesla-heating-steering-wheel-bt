@@ -1,1 +1,1 @@
-# tesla-heating-steering-wheel-bt
+esp-idf: v5.1.2 stable
