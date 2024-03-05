@@ -3,6 +3,7 @@
 
 #define BUZZER_PIN GPIO_NUM_18
 
+void human_countable_blocking_beep(unsigned int beeps);
 void blocking_beep(unsigned int beeps);
 void blocking_single_beep_ms(unsigned int duration_ms);
 void long_blocking_beep();

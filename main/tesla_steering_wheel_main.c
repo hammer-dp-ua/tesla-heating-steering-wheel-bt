@@ -35,21 +35,21 @@
 
 static const char *TAG = "TESLA_STEERING_WHEEL";
 
-static bt_input_t bt_input;
+static bt_input_t bt_input = {};
 
-static TimerHandle_t scan_bt_timer;
-static TimerHandle_t temperature_read_timer;
+static TimerHandle_t scan_bt_timer = NULL;
+static TimerHandle_t temperature_read_timer = NULL;
 
-static const TaskHandle_t update_beep_task;
+static TaskHandle_t update_beep_task = NULL;
 
 static esp_hidh_dev_t *opened_bt_device = NULL;
 
 static heating_temperature_t heating_temperature = HEATING_TEMP_MIDDLE;
 
-static unsigned int general_flags;
+static unsigned int general_flags = 0;
 
-static adc_oneshot_unit_handle_t adc1_handle;
-static adc_cali_handle_t adc_cali_temperature_sensor_handle;
+static adc_oneshot_unit_handle_t adc1_handle = NULL;
+static adc_cali_handle_t adc_cali_temperature_sensor_handle = NULL;
 static bool do_calibration_temperature_sensor = false;
 
 static unsigned char wifi_retry_num = 0;
@@ -71,24 +71,43 @@ static void clear_bt_input()
     bt_input = (bt_input_t) {};
 }
 
+static void ota_event_handler(ota_status_t ota_status, unsigned char error_number)
+{
+    if (ota_status == OTA_ERROR) {
+        vTaskDelete(update_beep_task);
+        update_beep_task = NULL;
+
+        turn_beeper_off();
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        human_countable_blocking_beep(error_number);
+
+        esp_wifi_disconnect();
+    } else if (ota_status == OTA_OK) {
+        vTaskDelete(update_beep_task);
+        blocking_single_beep_ms(2000);
+    } else if (ota_status == OTA_START_DOWNLOADING) {
+        vTaskDelete(update_beep_task);
+        fast_infinite_beep(&update_beep_task);
+    }
+}
+
+static void create_ota_task()
+{
+    xTaskCreate(&ota_task, "ota", 8 * 1024, &ota_event_handler, 5, NULL);
+}
+
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (wifi_retry_num < WIFI_MAXIMUM_RETRY) {
-            esp_wifi_connect();
+        reset_flag(&general_flags, WIFI_CONNECTED_FLAG);
 
-            wifi_retry_num++;
-
-            ESP_LOGI(TAG, "Retry to connect to the AP");
-        } else {
-            //xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            wifi_retry_num = 0;
-
+        if (update_beep_task != NULL) {
             vTaskDelete(update_beep_task);
-            turn_beeper_off();
         }
+
+        turn_beeper_off();
 
         ESP_LOGI(TAG, "Connection to the AP failed");
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -97,13 +116,13 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
 
         wifi_retry_num = 0;
-        //xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        set_flag(&general_flags, WIFI_CONNECTED_FLAG);
 
-        xTaskCreate(&ota_task, "ota", 8 * 1024, &update_beep_task, 5, NULL);
+        create_ota_task();
     }
 }
 
-static void connect_to_wifi()
+static void init_connect_to_wifi()
 {
     ESP_ERROR_CHECK(esp_netif_init());
 
@@ -141,10 +160,12 @@ static void connect_to_wifi()
             .sae_h2e_identifier = WIFI_H2E_IDENTIFIER,
         },
     };
-
+    
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    set_flag(&general_flags, WIFI_INITIALIZED_FLAG);
 
     ESP_LOGI(TAG, "wifi_init_sta finished.");
 }
@@ -152,8 +173,13 @@ static void connect_to_wifi()
 static void update_software()
 {
     infinite_beep(&update_beep_task);
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
 
-    connect_to_wifi();
+    if (read_flag(general_flags, WIFI_INITIALIZED_FLAG)) {
+        esp_wifi_connect();
+    } else {
+        init_connect_to_wifi();
+    }
 }
 
 static void increase_heating_temperature()
@@ -176,8 +202,6 @@ static void decrease_heating_temperature()
 
 static void process_bt_input(esp_hidh_event_data_t *esp_hidh_event_data)
 {
-    //esp_hidh_event_data_t *esp_hidh_event_data = (esp_hidh_event_data_t *)pvParameters;
-
     if (esp_hidh_event_data == NULL) {
         return;
     }
@@ -223,15 +247,15 @@ static void process_bt_input(esp_hidh_event_data_t *esp_hidh_event_data)
 
             switch (bt_input.button_candidate.button) {
                 case START_STOP_BUTTON: {
-                    beep(1);
-
                     if (read_flag(general_flags, STEERING_WHEEL_IS_TURNED_ON_FLAG)) {
                         reset_flag(&general_flags, STEERING_WHEEL_IS_TURNED_ON_FLAG);
                         reset_flag(&general_flags, STEERING_WHEEL_HEATING_IS_ACTIVE_FLAG);
 
                         gpio_set_level(GPIO_OUTPUT_IO_TRANSISTOR, 0);
+                        beep(2);
                     } else {
                         set_flag(&general_flags, STEERING_WHEEL_IS_TURNED_ON_FLAG);
+                        beep(1);
                     }
                     break;
                 }
@@ -305,10 +329,10 @@ static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id,
                 ESP_LOGI(TAG, ESP_BD_ADDR_STR " OPEN: %s", ESP_BD_ADDR_HEX(bda), esp_hidh_dev_name_get(param->open.dev));
                 esp_hidh_dev_dump(param->open.dev, stdout);
                 
-                beep(3);
+                beep(1);
             } else {
                 ESP_LOGE(TAG, " OPEN failed!");
-                beep(10);
+                beep(3);
             }
             break;
         }
@@ -540,7 +564,7 @@ static bool adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_att
 
 #if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
     if (!calibrated) {
-        ESP_LOGI(TAG, "calibration scheme version is %s", "Curve Fitting");
+        ESP_LOGI(TAG, "Calibration scheme version is %s", "Curve Fitting");
 
         adc_cali_curve_fitting_config_t cali_config = {
             .unit_id = unit,
@@ -574,7 +598,7 @@ static bool adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_att
 
     *out_handle = handle;
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Calibration Success");
+        ESP_LOGI(TAG, "Calibration success");
     } else if (ret == ESP_ERR_NOT_SUPPORTED || !calibrated) {
         ESP_LOGW(TAG, "eFuse not burnt, skip software calibration");
     } else {
@@ -587,10 +611,10 @@ static bool adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_att
 static void adc_init()
 {
     //-------------ADC1 Init---------------//
-    adc_oneshot_unit_init_cfg_t init_config1 = {
+    adc_oneshot_unit_init_cfg_t init_config = {
         .unit_id = ADC_UNIT_1,
     };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc1_handle));
 
     //-------------ADC1 Config---------------//
     adc_oneshot_chan_cfg_t config = {
@@ -604,6 +628,8 @@ static void adc_init()
     do_calibration_temperature_sensor = adc_calibration_init(ADC_UNIT_1, TEMPERATURE_SENSOR_ADC1_CHANNEL, ADC_ATTEN, &adc_cali_temperature_sensor_handle);
 }
 
+// Enable configUSE_TRACE_FACILITY, configUSE_STATS_FORMATTING_FUNCTIONS, xCoreID
+#if INCLUDE_xTaskGetHandle == 1 && configUSE_TRACE_FACILITY == 1
 static void get_debug_task_info(char *task_name)
 {
     TaskHandle_t xHandle = xTaskGetHandle(task_name);
@@ -611,8 +637,12 @@ static void get_debug_task_info(char *task_name)
 
     TaskStatus_t xTaskDetails;
     vTaskGetInfo(xHandle, &xTaskDetails, pdTRUE, eInvalid );
-    ESP_LOGI(TAG, "Task '%s'. Stack high water mark: %u. Task number: %u", xTaskDetails.pcTaskName, (unsigned int)xTaskDetails.usStackHighWaterMark, xTaskDetails.xTaskNumber);
+    ESP_LOGI(TAG, "Task '%s'. Stack high water mark: %u. Task number: %u",
+            xTaskDetails.pcTaskName,
+            (unsigned int)xTaskDetails.usStackHighWaterMark,
+            xTaskDetails.xTaskNumber);
 }
+#endif
 
 static bool diagnostic(void)
 {
@@ -713,10 +743,12 @@ void app_main(void)
     temperature_read_timer = xTimerCreate("temperature_read_timer", (2000 / portTICK_PERIOD_MS), pdTRUE, (void *) &temperature_read_timer_tmr_id, read_temperature);
     xTimerStart(temperature_read_timer, portMAX_DELAY);
 
-    /* while (1) {
+#if INCLUDE_xTaskGetHandle == 1 && configUSE_TRACE_FACILITY == 1
+    while (1) {
         get_debug_task_info("BTU_TASK");
         get_debug_task_info("read_temperature");
 
         vTaskDelay(5000 / portTICK_PERIOD_MS);
-    } */
+    }
+#endif
 }

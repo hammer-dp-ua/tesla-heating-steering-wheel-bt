@@ -7,6 +7,21 @@
 
 #include "beep.h"
 
+void human_countable_blocking_beep(unsigned int beeps)
+{
+    for (unsigned char i = 1; i <= beeps; i++) {
+        gpio_set_level(BUZZER_PIN, 1);
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+        gpio_set_level(BUZZER_PIN, 0);
+
+        if (i % 3 == 0) {
+            vTaskDelay(700 / portTICK_PERIOD_MS);
+        } else {
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+        }
+    }
+}
+
 void blocking_beep(unsigned int beeps)
 {
     for (unsigned char i = 0; i < beeps; i++) {

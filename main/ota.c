@@ -1,5 +1,4 @@
 #include "ota.h"
-#include "beep.h"
 
 static const char *TAG = "TESLA_STEERING_WHEEL_OTA";
 
@@ -24,25 +23,23 @@ static void http_cleanup(esp_http_client_handle_t client)
     esp_http_client_cleanup(client);
 }
 
-static void task_fatal_error(TaskHandle_t * const beep_task)
+static void task_fatal_error(ota_event_handler_t ota_event_handler, unsigned char beeps)
 {
-    ESP_LOGE(TAG, "Exiting task due to fatal error...");
+    ESP_LOGE(TAG, "Exiting task due to error...");
 
-    vTaskDelete(*beep_task);
-    turn_beeper_off();
-
+    ota_event_handler(OTA_ERROR, beeps);
     vTaskDelete(NULL);
 }
 
 void ota_task(void *pvParameter)
 {
-    TaskHandle_t * const beep_task = (TaskHandle_t *) pvParameter;
+    ota_event_handler_t ota_event_handler = (ota_event_handler_t) pvParameter;
     
     /* update handle : set by esp_ota_begin(), must be freed via esp_ota_end() */
-    esp_ota_handle_t update_handle = 0 ;
+    esp_ota_handle_t update_handle = 0;
     const esp_partition_t *update_partition = NULL;
 
-    ESP_LOGI(TAG, "Starting OTA example task");
+    ESP_LOGI(TAG, "Starting OTA task");
 
     const esp_partition_t *configured = esp_ota_get_boot_partition();
     const esp_partition_t *running = esp_ota_get_running_partition();
@@ -58,8 +55,6 @@ void ota_task(void *pvParameter)
 
     esp_http_client_config_t config = {
         .url = FIRMWARE_UPG_URL,
-        //.cert_pem = (char *)server_cert_pem_start,
-        //.skip_cert_common_name_check = true,
         .timeout_ms = OTA_RECV_TIMEOUT,
         .keep_alive_enable = true,
     };
@@ -67,7 +62,7 @@ void ota_task(void *pvParameter)
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
         ESP_LOGE(TAG, "Failed to initialise HTTP connection");
-        task_fatal_error(beep_task);
+        task_fatal_error(ota_event_handler, 2);
     }
 
     esp_err_t err = esp_http_client_open(client, 0);
@@ -75,7 +70,7 @@ void ota_task(void *pvParameter)
         ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
 
         esp_http_client_cleanup(client);
-        task_fatal_error(beep_task);
+        task_fatal_error(ota_event_handler, 3);
     }
 
     esp_http_client_fetch_headers(client);
@@ -97,7 +92,7 @@ void ota_task(void *pvParameter)
             ESP_LOGE(TAG, "Error: SSL data read error");
 
             http_cleanup(client);
-            task_fatal_error(beep_task);
+            task_fatal_error(ota_event_handler, 4);
         } else if (data_read > 0) {
             if (image_header_was_checked == false) {
                 esp_app_desc_t new_app_info;
@@ -127,7 +122,7 @@ void ota_task(void *pvParameter)
                             ESP_LOGW(TAG, "The firmware has been rolled back to the previous version.");
 
                             http_cleanup(client);
-                            //infinite_loop();
+                            task_fatal_error(ota_event_handler, 5);
                         }
                     }
 
@@ -135,13 +130,12 @@ void ota_task(void *pvParameter)
                         ESP_LOGW(TAG, "Current running version is the same as a new. We will not continue the update.");
 
                         http_cleanup(client);
-                        //infinite_loop();
+                        task_fatal_error(ota_event_handler, 6);
                     }
 
                     image_header_was_checked = true;
 
-                    vTaskDelete(*beep_task);
-                    fast_infinite_beep(beep_task);
+                    ota_event_handler(OTA_START_DOWNLOADING, 0);
 
                     err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle);
                     if (err != ESP_OK) {
@@ -149,7 +143,7 @@ void ota_task(void *pvParameter)
 
                         http_cleanup(client);
                         esp_ota_abort(update_handle);
-                        task_fatal_error(beep_task);
+                        task_fatal_error(ota_event_handler, 7);
                     }
                     
                     ESP_LOGI(TAG, "esp_ota_begin succeeded");
@@ -158,16 +152,16 @@ void ota_task(void *pvParameter)
 
                     http_cleanup(client);
                     esp_ota_abort(update_handle);
-                    task_fatal_error(beep_task);
+                    task_fatal_error(ota_event_handler, 8);
                 }
             }
 
-            err = esp_ota_write( update_handle, (const void *)ota_write_data, data_read);
+            err = esp_ota_write(update_handle, (const void *)ota_write_data, data_read);
             if (err != ESP_OK) {
                 http_cleanup(client);
                 esp_ota_abort(update_handle);
 
-                task_fatal_error(beep_task);
+                task_fatal_error(ota_event_handler, 9);
             }
 
             binary_file_length += data_read;
@@ -197,8 +191,10 @@ void ota_task(void *pvParameter)
 
         http_cleanup(client);
         esp_ota_abort(update_handle);
-        task_fatal_error(beep_task);
+        task_fatal_error(ota_event_handler, 10);
     }
+
+    ESP_LOGI(TAG, "Receiving complete");
 
     err = esp_ota_end(update_handle);
     if (err != ESP_OK) {
@@ -209,21 +205,22 @@ void ota_task(void *pvParameter)
         }
 
         http_cleanup(client);
-        task_fatal_error(beep_task);
+        task_fatal_error(ota_event_handler, 11);
     }
+
+    ESP_LOGI(TAG, "esp_ota_end OK");
 
     err = esp_ota_set_boot_partition(update_partition);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_set_boot_partition failed (%s)!", esp_err_to_name(err));
         
         http_cleanup(client);
-        task_fatal_error(beep_task);
+        task_fatal_error(ota_event_handler, 12);
     }
 
     ESP_LOGI(TAG, "Prepare to restart system!");
 
-    vTaskDelete(*beep_task);
-    blocking_single_beep_ms(2000);
+    ota_event_handler(OTA_OK, 0);
 
     esp_restart();
     return ;

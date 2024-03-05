@@ -13,6 +13,8 @@
 
 #define STEERING_WHEEL_IS_TURNED_ON_FLAG        1 // Overall state
 #define STEERING_WHEEL_HEATING_IS_ACTIVE_FLAG   2 // Depends on current temperature
+#define WIFI_CONNECTED_FLAG                     4
+#define WIFI_INITIALIZED_FLAG                   8
 
 #define TEMPERATURE_SENSOR_ADC1_CHANNEL ADC_CHANNEL_2 // GPIO3
 #define ADC_ATTEN ADC_ATTEN_DB_0 // Atten = 0, effective measurement range of 100 ∼ 950 mV
