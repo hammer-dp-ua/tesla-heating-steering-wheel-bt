@@ -44,7 +44,7 @@ static TaskHandle_t update_beep_task = NULL;
 
 static esp_hidh_dev_t *opened_bt_device = NULL;
 
-static heating_temperature_t heating_temperature = HEATING_TEMP_MIDDLE;
+static heating_temperature_t heating_temperature = HEATING_TEMP_LOW;
 
 static unsigned int general_flags = 0;
 
@@ -200,6 +200,14 @@ static void decrease_heating_temperature()
     beep(heating_temperature);
 }
 
+static void turn_steering_wheel_off()
+{
+    reset_flag(&general_flags, STEERING_WHEEL_IS_TURNED_ON_FLAG);
+    reset_flag(&general_flags, STEERING_WHEEL_HEATING_IS_ACTIVE_FLAG);
+
+    gpio_set_level(GPIO_OUTPUT_IO_TRANSISTOR, 0);
+}
+
 static void process_bt_input(esp_hidh_event_data_t *esp_hidh_event_data)
 {
     if (esp_hidh_event_data == NULL) {
@@ -248,10 +256,8 @@ static void process_bt_input(esp_hidh_event_data_t *esp_hidh_event_data)
             switch (bt_input.button_candidate.button) {
                 case START_STOP_BUTTON: {
                     if (read_flag(general_flags, STEERING_WHEEL_IS_TURNED_ON_FLAG)) {
-                        reset_flag(&general_flags, STEERING_WHEEL_IS_TURNED_ON_FLAG);
-                        reset_flag(&general_flags, STEERING_WHEEL_HEATING_IS_ACTIVE_FLAG);
+                        turn_steering_wheel_off();
 
-                        gpio_set_level(GPIO_OUTPUT_IO_TRANSISTOR, 0);
                         beep(2);
                     } else {
                         set_flag(&general_flags, STEERING_WHEEL_IS_TURNED_ON_FLAG);
@@ -436,10 +442,22 @@ static void hid_scanning_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-static void scan_bt(TimerHandle_t arg)
+static bool is_tesla_led_turned_on()
 {
-    if (!esp_hidh_dev_exists(opened_bt_device)) {
+    return gpio_get_level(GPIO_INPUT_IO_EXTERNAL_LED);
+}
+
+static void check_input_led_state_and_scan_bt(TimerHandle_t arg)
+{
+    if (is_tesla_led_turned_on() && !esp_hidh_dev_exists(opened_bt_device)) {
         xTaskCreate(&hid_scanning_task, "hid_scanning", 4 * 1024, NULL, 2, NULL);
+    } else if (!is_tesla_led_turned_on()) {
+        turn_steering_wheel_off();
+
+        if (opened_bt_device != NULL) {
+            esp_hidh_dev_close(opened_bt_device);
+            opened_bt_device = NULL;
+        }
     }
 }
 
@@ -553,6 +571,14 @@ static void pins_config()
     io_diag_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     io_diag_conf.pull_up_en = GPIO_PULLUP_ENABLE;
     gpio_config(&io_diag_conf);
+
+    gpio_config_t io_input_conf = {};
+    io_input_conf.intr_type = GPIO_INTR_DISABLE;
+    io_input_conf.mode = GPIO_MODE_INPUT;
+    io_input_conf.pin_bit_mask = (1ULL<<GPIO_INPUT_IO_EXTERNAL_LED);
+    io_input_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_input_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config(&io_input_conf);
 }
 
 // ADC Calibration
@@ -656,6 +682,24 @@ static bool diagnostic(void)
     return diagnostic_is_ok;
 }
 
+static void bt_init()
+{
+    ESP_LOGI(TAG, "Setting HID gap, mode: %d", HID_HOST_MODE);
+    ESP_ERROR_CHECK( esp_hid_gap_init(HID_HOST_MODE) );
+
+#if CONFIG_BT_BLE_ENABLED
+    ESP_ERROR_CHECK( esp_ble_gattc_register_callback(esp_hidh_gattc_event_handler) );
+#endif /* CONFIG_BT_BLE_ENABLED */
+
+    esp_hidh_config_t config = {
+        .callback = hidh_callback,
+        .event_stack_size = 3 * 1024,
+        .callback_arg = NULL,
+    };
+
+    ESP_ERROR_CHECK(esp_hidh_init(&config));
+}
+
 void app_main(void)
 {
 #if HID_HOST_MODE == HIDH_IDLE_MODE
@@ -718,25 +762,12 @@ void app_main(void)
 
     adc_init();
 
-    ESP_LOGI(TAG, "setting hid gap, mode:%d", HID_HOST_MODE);
-    ESP_ERROR_CHECK( esp_hid_gap_init(HID_HOST_MODE) );
+    bt_init();
 
-#if CONFIG_BT_BLE_ENABLED
-    ESP_ERROR_CHECK( esp_ble_gattc_register_callback(esp_hidh_gattc_event_handler) );
-#endif /* CONFIG_BT_BLE_ENABLED */
-
-    esp_hidh_config_t config = {
-        .callback = hidh_callback, // "esp_ble_hidh_ev" task
-        .event_stack_size = 3 * 1024,
-        .callback_arg = NULL,
-    };
-
-    ESP_ERROR_CHECK(esp_hidh_init(&config));
-
-    scan_bt(NULL);
+    check_input_led_state_and_scan_bt(NULL);
 
     int scan_bt_timer_tmr_id = 0;
-    scan_bt_timer = xTimerCreate("scan_bt_timer", (20000 / portTICK_PERIOD_MS), pdTRUE, (void *) &scan_bt_timer_tmr_id, scan_bt);
+    scan_bt_timer = xTimerCreate("scan_bt_timer", (20000 / portTICK_PERIOD_MS), pdTRUE, (void *) &scan_bt_timer_tmr_id, check_input_led_state_and_scan_bt);
     xTimerStart(scan_bt_timer, portMAX_DELAY);
 
     int temperature_read_timer_tmr_id = 1;
