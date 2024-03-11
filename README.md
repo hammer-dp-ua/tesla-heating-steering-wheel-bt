@@ -3,6 +3,7 @@
 Original M3 2018 steering wheel was replaced by 2021 M3/MY from Tesla restyle.
 
 Controlled by Bluetooth button:
+
 ![Bluetooth button](https://github.com/hammer-dp-ua/tesla-heating-steering-wheel-bt/blob/main/scheme/Bluetooth_button.jpeg)
 
 Heating steering wheel power consumption is about 6 Amps / 100W.
