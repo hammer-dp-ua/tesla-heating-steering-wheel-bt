@@ -24,5 +24,5 @@ Heating steering wheel power consumption is about 6 Amps / 100W.
 And it turns out there is overcurrent protection in Tesla Body Left Controller that turns off heating steering wheel.
 I just cut pin 23 (violet, 0.75) on J6/X035 connector and connected the wire directly to 12V line using 10A fuse.
 
-![Tesla J6/X035](https://github.com/hammer-dp-ua/tesla-heating-steering-wheel-bt/blob/main/scheme/Tesla_J6-X035.svg)
+![Tesla J6/X035](https://github.com/hammer-dp-ua/tesla-heating-steering-wheel-bt/blob/main/scheme/Tesla_J6-X035.jpg)
 ![Tesla J6/X035 photo](https://github.com/hammer-dp-ua/tesla-heating-steering-wheel-bt/blob/main/scheme/Tesla-J6-X035_photo.jpg)
