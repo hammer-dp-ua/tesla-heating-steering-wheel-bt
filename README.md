@@ -9,15 +9,15 @@ Controlled by Bluetooth button:
 ![Bluetooth button](https://github.com/hammer-dp-ua/tesla-heating-steering-wheel-bt/blob/main/scheme/Bluetooth_button.jpeg)
 
 ## Buttons functionality
-"+" button increases temperature.
+**+** button increases temperature.
 
-"-" button decreases temperature.
+**-** button decreases temperature.
 
 Supported temperatures: 20-30-40°C (1 beep / 2 beeps / 3 beeps).
 
-"Start/Stop" button turns on heating (1 beep) / turns off heating (2 beeps).
+**Start/Stop** button turns on heating (1 beep) / turns off heating (2 beeps).
 
-"Forward" long press button starts OTA process.
+**Forward** long press button starts OTA process.
 
 ## Tesla power limits
 Heating steering wheel power consumption is about 6 Amps / 100W.
