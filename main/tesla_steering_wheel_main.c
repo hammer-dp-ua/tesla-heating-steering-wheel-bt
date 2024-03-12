@@ -39,18 +39,21 @@ static bt_input_t bt_input = {};
 
 static TimerHandle_t scan_bt_timer = NULL;
 static TimerHandle_t temperature_read_timer = NULL;
+static TimerHandle_t tesla_led_read_timer = NULL;
 
 static TaskHandle_t update_beep_task = NULL;
 
 static esp_hidh_dev_t *opened_bt_device = NULL;
 
-static heating_temperature_t heating_temperature = HEATING_TEMP_LOW;
-
+static heating_temperature_t heating_temperature = HEATING_TEMP_MIDDLE;
+    
 static unsigned int general_flags = 0;
 
 static adc_oneshot_unit_handle_t adc1_handle = NULL;
 static adc_cali_handle_t adc_cali_temperature_sensor_handle = NULL;
+static adc_cali_handle_t adc_cali_led_handle = NULL;
 static bool do_calibration_temperature_sensor = false;
+static bool do_calibration_led = false;
 
 static unsigned char wifi_retry_num = 0;
 
@@ -444,7 +447,7 @@ static void hid_scanning_task(void *pvParameters)
 
 static bool is_tesla_led_turned_on()
 {
-    return gpio_get_level(GPIO_INPUT_IO_EXTERNAL_LED);
+    return read_flag(general_flags, TESLA_LED_IS_TURNED_ON);
 }
 
 static void check_input_led_state_and_scan_bt(TimerHandle_t arg)
@@ -473,18 +476,18 @@ static float calculate_ntc_temperature(float temp_sensor_resistance)
     return temperature;
 }
 
-static void read_temperature_task(void *pvParameters)
+static unsigned int read_adc_voltage(adc_channel_t adc_channel, adc_cali_handle_t adc_cali_handle, bool do_calibration)
 {
-    int voltage_accumulator = 0;
+    unsigned int voltage_accumulator = 0;
 
     for (unsigned char i = 0; i < ADC_SAMPLES; i++) {
         int adc_raw = 0;
-        ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, TEMPERATURE_SENSOR_ADC1_CHANNEL, &adc_raw));
+        ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, adc_channel, &adc_raw));
         //ESP_LOGI(TAG, "ADC Raw Data: %d", adc_raw);
 
-        if (do_calibration_temperature_sensor) {
+        if (do_calibration) {
             int voltage = 0;
-            ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc_cali_temperature_sensor_handle, adc_raw, &voltage));
+            ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc_cali_handle, adc_raw, &voltage));
 
             voltage_accumulator += voltage;
         }
@@ -492,10 +495,17 @@ static void read_temperature_task(void *pvParameters)
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
     
-    int voltage_avarage_mv = voltage_accumulator / ADC_SAMPLES;
+    unsigned int voltage_avarage_mv = voltage_accumulator / ADC_SAMPLES;
     ESP_LOGI(TAG, "ADC calibration Voltage: %d mV", voltage_avarage_mv);
+    return voltage_avarage_mv;
+}
 
-    float series_resistor_voltage = (float)voltage_avarage_mv / 1000.0f;
+static void read_temperature_task(void *pvParameters)
+{
+    unsigned int voltage_mv =
+            read_adc_voltage(TEMPERATURE_SENSOR_ADC1_CHANNEL, adc_cali_temperature_sensor_handle, do_calibration_temperature_sensor);
+
+    float series_resistor_voltage = (float)voltage_mv / 1000.0f;
  
     float current = series_resistor_voltage / TEMPERATURE_SENSOR_SERIES_RESISTOR;
     float temp_sensor_resistance = (TEMPERATURE_SENSOR_V_REF - series_resistor_voltage) / current;
@@ -547,6 +557,30 @@ static void read_temperature(TimerHandle_t arg)
     }
 }
 
+static void read_tesla_led_task(void *pvParameters)
+{
+    unsigned int voltage_mv =
+            read_adc_voltage(EXTERNAL_TESLA_LED_ADC1_CHANNEL, adc_cali_led_handle, do_calibration_led);
+
+    if (voltage_mv >= 150) {
+        set_flag(&general_flags, TESLA_LED_IS_TURNED_ON);
+    } else {
+        reset_flag(&general_flags, TESLA_LED_IS_TURNED_ON);
+
+        if (read_flag(general_flags, TESLA_LED_IS_TURNED_ON)) {
+            // beep once
+            blocking_beep(2);
+        }
+    }
+
+    vTaskDelete(NULL);
+}
+
+static void read_tesla_led()
+{
+    xTaskCreate(&read_tesla_led_task, "read_tesla_led", 3 * 1024, NULL, 2, NULL);
+}
+
 static void pins_config()
 {
     //zero-initialize the config structure.
@@ -555,7 +589,7 @@ static void pins_config()
     io_conf.intr_type = GPIO_INTR_DISABLE;
     //set as output mode
     io_conf.mode = GPIO_MODE_OUTPUT;
-    //bit mask of the pins that you want to set,e.g.GPIO18/19
+    //bit mask of the pins that you want to set, e.g.GPIO18/19
     io_conf.pin_bit_mask = GPIO_OUTPUT_PIN_SEL;
     //disable pull-down mode
     io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
@@ -572,13 +606,14 @@ static void pins_config()
     io_diag_conf.pull_up_en = GPIO_PULLUP_ENABLE;
     gpio_config(&io_diag_conf);
 
-    gpio_config_t io_input_conf = {};
+    // Replaced by ADC read because of variable voltage LED
+    /* gpio_config_t io_input_conf = {};
     io_input_conf.intr_type = GPIO_INTR_DISABLE;
     io_input_conf.mode = GPIO_MODE_INPUT;
     io_input_conf.pin_bit_mask = (1ULL<<GPIO_INPUT_IO_EXTERNAL_LED);
     io_input_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     io_input_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-    gpio_config(&io_input_conf);
+    gpio_config(&io_input_conf); */
 }
 
 // ADC Calibration
@@ -649,9 +684,11 @@ static void adc_init()
     };
 
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, TEMPERATURE_SENSOR_ADC1_CHANNEL, &config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, EXTERNAL_TESLA_LED_ADC1_CHANNEL, &config));
 
     //-------------ADC1 Calibration Init---------------//
     do_calibration_temperature_sensor = adc_calibration_init(ADC_UNIT_1, TEMPERATURE_SENSOR_ADC1_CHANNEL, ADC_ATTEN, &adc_cali_temperature_sensor_handle);
+    do_calibration_led = adc_calibration_init(ADC_UNIT_1, EXTERNAL_TESLA_LED_ADC1_CHANNEL, ADC_ATTEN, &adc_cali_led_handle);
 }
 
 // Enable configUSE_TRACE_FACILITY, configUSE_STATS_FORMATTING_FUNCTIONS, xCoreID
@@ -760,8 +797,9 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
-    adc_init();
+    blocking_beep(3);
 
+    adc_init();
     bt_init();
 
     check_input_led_state_and_scan_bt(NULL);
@@ -773,6 +811,10 @@ void app_main(void)
     int temperature_read_timer_tmr_id = 1;
     temperature_read_timer = xTimerCreate("temperature_read_timer", (2000 / portTICK_PERIOD_MS), pdTRUE, (void *) &temperature_read_timer_tmr_id, read_temperature);
     xTimerStart(temperature_read_timer, portMAX_DELAY);
+
+    int tesla_led_read_timer_tmr_id = 2;
+    tesla_led_read_timer = xTimerCreate("tesla_led_read_timer", (10000 / portTICK_PERIOD_MS), pdTRUE, (void *) &tesla_led_read_timer_tmr_id, read_tesla_led);
+    xTimerStart(tesla_led_read_timer, portMAX_DELAY);
 
 #if INCLUDE_xTaskGetHandle == 1 && configUSE_TRACE_FACILITY == 1
     while (1) {
