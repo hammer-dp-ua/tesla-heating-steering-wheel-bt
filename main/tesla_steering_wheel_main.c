@@ -211,6 +211,16 @@ static void turn_steering_wheel_off()
     gpio_set_level(GPIO_OUTPUT_IO_TRANSISTOR, 0);
 }
 
+static void turn_steering_wheel_on()
+{
+    set_flag(&general_flags, STEERING_WHEEL_IS_TURNED_ON_FLAG);
+}
+
+static bool is_steering_wheel_turned_on()
+{
+    return read_flag(general_flags, STEERING_WHEEL_IS_TURNED_ON_FLAG);
+}
+
 static void process_bt_input(esp_hidh_event_data_t *esp_hidh_event_data)
 {
     if (esp_hidh_event_data == NULL) {
@@ -258,12 +268,12 @@ static void process_bt_input(esp_hidh_event_data_t *esp_hidh_event_data)
 
             switch (bt_input.button_candidate.button) {
                 case START_STOP_BUTTON: {
-                    if (read_flag(general_flags, STEERING_WHEEL_IS_TURNED_ON_FLAG)) {
+                    if (is_steering_wheel_turned_on()) {
                         turn_steering_wheel_off();
 
                         beep(2);
                     } else {
-                        set_flag(&general_flags, STEERING_WHEEL_IS_TURNED_ON_FLAG);
+                        turn_steering_wheel_on();
                         beep(1);
                     }
                     break;
@@ -337,11 +347,12 @@ static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id,
                 const uint8_t *bda = esp_hidh_dev_bda_get(param->open.dev);
                 ESP_LOGI(TAG, ESP_BD_ADDR_STR " OPEN: %s", ESP_BD_ADDR_HEX(bda), esp_hidh_dev_name_get(param->open.dev));
                 esp_hidh_dev_dump(param->open.dev, stdout);
-                
+                    
+                turn_steering_wheel_on();
                 beep(1);
             } else {
                 ESP_LOGE(TAG, " OPEN failed!");
-                beep(3);
+                beep(4);
             }
             break;
         }
@@ -532,6 +543,7 @@ static void read_temperature_task(void *pvParameters)
             break;
     }
 
+    // histeresis calculation
     if (read_flag(general_flags, STEERING_WHEEL_HEATING_IS_ACTIVE_FLAG)) {
         expected_temperature += TEMPERATURE_HISTERESIS;
     } else {
@@ -552,7 +564,7 @@ static void read_temperature_task(void *pvParameters)
 
 static void read_temperature(TimerHandle_t arg)
 {
-    if (read_flag(general_flags, STEERING_WHEEL_IS_TURNED_ON_FLAG)) {
+    if (is_steering_wheel_turned_on()) {
         xTaskCreate(&read_temperature_task, "read_temperature", 3 * 1024, NULL, 2, NULL);
     }
 }
@@ -562,15 +574,14 @@ static void read_tesla_led_task(void *pvParameters)
     unsigned int voltage_mv =
             read_adc_voltage(EXTERNAL_TESLA_LED_ADC1_CHANNEL, adc_cali_led_handle, do_calibration_led);
 
-    if (voltage_mv >= 150) {
+    if (voltage_mv >= 50) {
         set_flag(&general_flags, TESLA_LED_IS_TURNED_ON);
     } else {
-        reset_flag(&general_flags, TESLA_LED_IS_TURNED_ON);
-
-        if (read_flag(general_flags, TESLA_LED_IS_TURNED_ON)) {
-            // beep once
+        if (read_flag(general_flags, TESLA_LED_IS_TURNED_ON) && is_steering_wheel_turned_on()) {
             blocking_beep(2);
         }
+
+        reset_flag(&general_flags, TESLA_LED_IS_TURNED_ON);
     }
 
     vTaskDelete(NULL);
@@ -805,15 +816,15 @@ void app_main(void)
     check_input_led_state_and_scan_bt(NULL);
 
     int scan_bt_timer_tmr_id = 0;
-    scan_bt_timer = xTimerCreate("scan_bt_timer", (20000 / portTICK_PERIOD_MS), pdTRUE, (void *) &scan_bt_timer_tmr_id, check_input_led_state_and_scan_bt);
+    scan_bt_timer = xTimerCreate("scan_bt_timer", (10000 / portTICK_PERIOD_MS), pdTRUE, (void *) &scan_bt_timer_tmr_id, check_input_led_state_and_scan_bt);
     xTimerStart(scan_bt_timer, portMAX_DELAY);
 
     int temperature_read_timer_tmr_id = 1;
-    temperature_read_timer = xTimerCreate("temperature_read_timer", (2000 / portTICK_PERIOD_MS), pdTRUE, (void *) &temperature_read_timer_tmr_id, read_temperature);
+    temperature_read_timer = xTimerCreate("temperature_read_timer", (5000 / portTICK_PERIOD_MS), pdTRUE, (void *) &temperature_read_timer_tmr_id, read_temperature);
     xTimerStart(temperature_read_timer, portMAX_DELAY);
 
     int tesla_led_read_timer_tmr_id = 2;
-    tesla_led_read_timer = xTimerCreate("tesla_led_read_timer", (10000 / portTICK_PERIOD_MS), pdTRUE, (void *) &tesla_led_read_timer_tmr_id, read_tesla_led);
+    tesla_led_read_timer = xTimerCreate("tesla_led_read_timer", (5000 / portTICK_PERIOD_MS), pdTRUE, (void *) &tesla_led_read_timer_tmr_id, read_tesla_led);
     xTimerStart(tesla_led_read_timer, portMAX_DELAY);
 
 #if INCLUDE_xTaskGetHandle == 1 && configUSE_TRACE_FACILITY == 1

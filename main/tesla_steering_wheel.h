@@ -23,7 +23,7 @@
 #define EXTERNAL_TESLA_LED_ADC1_CHANNEL ADC_CHANNEL_9 // GPIO_NUM_10
 
 #define ADC_ATTEN ADC_ATTEN_DB_0 // Atten = 0, effective measurement range of 100 ∼ 950 mV
-#define ADC_SAMPLES 5
+#define ADC_SAMPLES 20
 #define TEMPERATURE_SENSOR_SERIES_RESISTOR  1500.0f // Ohms
 #define TEMPERATURE_SENSOR_V_REF            3.3f // V
 #define TEMPERATURE_SENSOR_NTC_R_NOMINAL    10000.0f
