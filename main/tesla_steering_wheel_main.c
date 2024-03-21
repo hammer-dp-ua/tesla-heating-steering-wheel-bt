@@ -3,31 +3,26 @@
 #include <string.h>
 #include <math.h>
 
+#include "sdkconfig.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
 #include "freertos/event_groups.h"
+#include "freertos/queue.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
-#include "esp_bt.h"
-#include "esp_bt_defs.h"
-#include "esp_gap_ble_api.h"
-#include "esp_gatts_api.h"
-#include "esp_gatt_defs.h"
-#include "esp_bt_main.h"
-#include "esp_bt_device.h"
-
-#include "esp_hidh.h"
-#include "esp_hid_gap.h"
 
 #include "esp_adc/adc_oneshot.h"
 
+#include "esp_private/esp_clk.h"
+#include "driver/mcpwm_cap.h"
+#include "driver/gptimer.h"
 #include "driver/gpio.h"
 
-#include "smart_remote_keys.h"
 #include "tesla_steering_wheel.h"
 #include "ota.h"
 #include "beep.h"
@@ -35,15 +30,11 @@
 
 static const char *TAG = "TESLA_STEERING_WHEEL";
 
-static bt_input_t bt_input = {};
-
-static TimerHandle_t scan_bt_timer = NULL;
 static TimerHandle_t temperature_read_timer = NULL;
-static TimerHandle_t tesla_led_read_timer = NULL;
 
 static TaskHandle_t update_beep_task = NULL;
 
-static esp_hidh_dev_t *opened_bt_device = NULL;
+static gptimer_handle_t gptimer = NULL;
 
 static heating_temperature_t heating_temperature = HEATING_TEMP_MIDDLE;
     
@@ -51,11 +42,9 @@ static unsigned int general_flags = 0;
 
 static adc_oneshot_unit_handle_t adc1_handle = NULL;
 static adc_cali_handle_t adc_cali_temperature_sensor_handle = NULL;
-static adc_cali_handle_t adc_cali_led_handle = NULL;
 static bool do_calibration_temperature_sensor = false;
-static bool do_calibration_led = false;
 
-static unsigned char wifi_retry_num = 0;
+static uint32_t external_led_pwm_ticks = 0;
 
 void set_flag(unsigned int *flags, unsigned int flag) {
    *flags |= flag;
@@ -67,11 +56,6 @@ void reset_flag(unsigned int *flags, unsigned int flag) {
 
 bool read_flag(unsigned int flags, unsigned int flag) {
    return (flags & flag);
-}
-
-static void clear_bt_input()
-{
-    bt_input = (bt_input_t) {};
 }
 
 static void ota_event_handler(ota_status_t ota_status, unsigned char error_number)
@@ -118,7 +102,6 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
 
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
 
-        wifi_retry_num = 0;
         set_flag(&general_flags, WIFI_CONNECTED_FLAG);
 
         create_ota_task();
@@ -221,258 +204,14 @@ static bool is_steering_wheel_turned_on()
     return read_flag(general_flags, STEERING_WHEEL_IS_TURNED_ON_FLAG);
 }
 
-static void process_bt_input(esp_hidh_event_data_t *esp_hidh_event_data)
-{
-    if (esp_hidh_event_data == NULL) {
-        return;
-    }
-
-    unsigned char *input_data = esp_hidh_event_data->input.data;
-    unsigned short input_data_length = esp_hidh_event_data->input.length;
-    
-    if (input_data == NULL || input_data_length == 0) {
-        return;
-    }
-    
-    if (bt_input.validated_bytes_cnt == 0) {
-        // detect a button by the first bytes data
-        for (unsigned char i = 0; i < bt_button_commands_length; i++) {
-            bt_button_command_t bt_button_command = bt_button_commands[i];
-            const char *bt_button_command_data = bt_button_command.data;
-            bool match = false;
-
-            for (unsigned char input_data_index = 0; input_data_index < input_data_length; input_data_index++) {
-                match = input_data[input_data_index] == bt_button_command_data[input_data_index];
-
-                if (!match) {
-                    break;
-                }
-            }
-
-            if (match) {
-                bt_input.button_candidate = bt_button_command;
-                bt_input.validated_bytes_cnt = input_data_length;
-
-                break;
-            }
-        }
-
-        if (bt_input.validated_bytes_cnt == 0) {
-            // Button not detected
-            clear_bt_input();
-        }
-    } else if (bt_input.validated_bytes_cnt == bt_input.button_candidate.data_length) {
-        // End of processing
-        if (input_data_length == 2 && input_data[0] == 0x00 && input_data[1] == 0x00) {
-            //ESP_LOGI(TAG, "Button pressed: %d", bt_input.button_candidate.button);
-
-            switch (bt_input.button_candidate.button) {
-                case START_STOP_BUTTON: {
-                    if (is_steering_wheel_turned_on()) {
-                        turn_steering_wheel_off();
-
-                        beep(2);
-                    } else {
-                        turn_steering_wheel_on();
-                        beep(1);
-                    }
-                    break;
-                }
-                case START_STOP_LONG_PRESS_BUTTON: {
-                    single_beep_ms(500);
-                    break;
-                }
-                case VOLUME_PLUS_BUTTON: {
-                    increase_heating_temperature();
-                    break;
-                }
-                case VOLUME_MINUS_BUTTON: {
-                    decrease_heating_temperature();
-                    break;
-                }
-                case VOLUME_PLUS_OR_MINUS_LONG_PRESS_BUTTON: {
-                    break;
-                }
-                case FORVARD_BUTTON: {
-                    break;
-                }
-                case FORVARD_LONG_PRESS_BUTTON: {
-                    update_software();
-                    break;
-                }
-                case BACK_BUTTON: {
-                    break;
-                }
-                case BACK_LONG_PRESS_BUTTON: {
-                    break;
-                }
-                default: {
-                    break;
-                }
-            }
-        }
-
-        clear_bt_input();
-    } else {
-        bool match = false;
-
-        for (unsigned char input_data_index = 0;
-            (input_data_index < input_data_length) && (bt_input.validated_bytes_cnt < bt_input.button_candidate.data_length);
-            input_data_index++) {
-
-            match = input_data[input_data_index] == bt_input.button_candidate.data[bt_input.validated_bytes_cnt];
-
-            if (!match) {
-                break;
-            }
-
-            bt_input.validated_bytes_cnt++;
-        }
-
-        if (!match) {
-            // Button not detected
-            clear_bt_input();
-        }
-    }
-}
-
-static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
-{
-    esp_hidh_event_t event = (esp_hidh_event_t)id;
-    esp_hidh_event_data_t *param = (esp_hidh_event_data_t *)event_data;
-
-    switch (event) {
-        case ESP_HIDH_OPEN_EVENT: {
-            if (param->open.status == ESP_OK) {
-                const uint8_t *bda = esp_hidh_dev_bda_get(param->open.dev);
-                ESP_LOGI(TAG, ESP_BD_ADDR_STR " OPEN: %s", ESP_BD_ADDR_HEX(bda), esp_hidh_dev_name_get(param->open.dev));
-                esp_hidh_dev_dump(param->open.dev, stdout);
-                    
-                turn_steering_wheel_on();
-                beep(1);
-            } else {
-                ESP_LOGE(TAG, " OPEN failed!");
-                beep(4);
-            }
-            break;
-        }
-        case ESP_HIDH_BATTERY_EVENT: {
-            const uint8_t *bda = esp_hidh_dev_bda_get(param->battery.dev);
-            ESP_LOGI(TAG, ESP_BD_ADDR_STR " BATTERY: %d%%", ESP_BD_ADDR_HEX(bda), param->battery.level);
-            break;
-        }
-        case ESP_HIDH_INPUT_EVENT: {
-            /* const uint8_t *bda = esp_hidh_dev_bda_get(param->input.dev);
-            ESP_LOGI(TAG, ESP_BD_ADDR_STR " INPUT: %8s, MAP: %2u, ID: %3u, Len: %d, Data:",
-                    ESP_BD_ADDR_HEX(bda), esp_hid_usage_str(param->input.usage), param->input.map_index, param->input.report_id, param->input.length);
-            ESP_LOG_BUFFER_HEX(TAG, param->input.data, param->input.length); */
-
-            process_bt_input(param);
-
-            break;
-        }
-        case ESP_HIDH_FEATURE_EVENT: {
-            const uint8_t *bda = esp_hidh_dev_bda_get(param->feature.dev);
-
-            ESP_LOGI(TAG, ESP_BD_ADDR_STR " FEATURE: %8s, MAP: %2u, ID: %3u, Len: %d", ESP_BD_ADDR_HEX(bda),
-                    esp_hid_usage_str(param->feature.usage), param->feature.map_index, param->feature.report_id,
-                    param->feature.length);
-            ESP_LOG_BUFFER_HEX(TAG, param->feature.data, param->feature.length);
-            break;
-        }
-        case ESP_HIDH_CLOSE_EVENT: {
-            const uint8_t *bda = esp_hidh_dev_bda_get(param->close.dev);
-            ESP_LOGI(TAG, ESP_BD_ADDR_STR " CLOSE: %s", ESP_BD_ADDR_HEX(bda), esp_hidh_dev_name_get(param->close.dev));
-            break;
-        }
-        default: {
-            ESP_LOGI(TAG, "EVENT: %d", event);
-            break;
-        }
-    }
-}
-
-#define SCAN_DURATION_SECONDS 1
-
-static void hid_scanning_task(void *pvParameters)
-{
-    size_t results_len = 0;
-    esp_hid_scan_result_t *results = NULL;
-
-    ESP_LOGI(TAG, "SCAN...");
-
-    //start scan for HID devices
-    esp_hid_scan(SCAN_DURATION_SECONDS, &results_len, &results);
-
-    ESP_LOGI(TAG, "SCAN: %u results", results_len);
-
-    if (results_len) {
-        esp_hid_scan_result_t *r = results;
-        esp_hid_scan_result_t *cr = NULL;
-
-        while (r) {
-            printf("  %s: " ESP_BD_ADDR_STR ", ", (r->transport == ESP_HID_TRANSPORT_BLE) ? "BLE" : "BT ", ESP_BD_ADDR_HEX(r->bda));
-            printf("RSSI: %d, ", r->rssi);
-            printf("USAGE: %s, ", esp_hid_usage_str(r->usage));
-
-#if CONFIG_BT_BLE_ENABLED
-            if (r->transport == ESP_HID_TRANSPORT_BLE) {
-                cr = r;
-                printf("APPEARANCE: 0x%04x, ", r->ble.appearance);
-                printf("ADDR_TYPE: '%s', ", ble_addr_type_str(r->ble.addr_type));
-            }
-#endif /* CONFIG_BT_BLE_ENABLED */
-
-#if CONFIG_BT_HID_HOST_ENABLED
-            if (r->transport == ESP_HID_TRANSPORT_BT) {
-                cr = r;
-                printf("COD: %s[", esp_hid_cod_major_str(r->bt.cod.major));
-                esp_hid_cod_minor_print(r->bt.cod.minor, stdout);
-                printf("] srv 0x%03x, ", r->bt.cod.service);
-                print_uuid(&r->bt.uuid);
-                printf(", ");
-            }
-#endif /* CONFIG_BT_HID_HOST_ENABLED */
-
-            printf("NAME: %s ", r->name ? r->name : "");
-            printf("\n");
-
-            r = r->next;
-        }
-
-        if (cr) {
-            //open the last result
-            esp_hidh_dev_t *new_opened_bt_device = esp_hidh_dev_open(cr->bda, cr->transport, cr->ble.addr_type);
-
-            if (new_opened_bt_device != NULL) {
-                opened_bt_device = new_opened_bt_device;
-            }
-        }
-
-        //free the results
-        esp_hid_scan_results_free(results);
-    }
-
-    vTaskDelete(NULL);
-}
-
 static bool is_tesla_led_turned_on()
 {
-    return read_flag(general_flags, TESLA_LED_IS_TURNED_ON);
-}
-
-static void check_input_led_state_and_scan_bt(TimerHandle_t arg)
-{
-    if (is_tesla_led_turned_on() && !esp_hidh_dev_exists(opened_bt_device)) {
-        xTaskCreate(&hid_scanning_task, "hid_scanning", 4 * 1024, NULL, 2, NULL);
-    } else if (!is_tesla_led_turned_on()) {
-        turn_steering_wheel_off();
-
-        if (opened_bt_device != NULL) {
-            esp_hidh_dev_close(opened_bt_device);
-            opened_bt_device = NULL;
-        }
-    }
+    uint32_t processor_frequency = (uint32_t)esp_clk_apb_freq();
+    unsigned int pwm_frequency = (external_led_pwm_ticks > 0 && processor_frequency > external_led_pwm_ticks)
+            ? (processor_frequency / external_led_pwm_ticks)
+            : 0;
+    
+    return pwm_frequency > 200 && pwm_frequency < 300;
 }
 
 static float calculate_ntc_temperature(float temp_sensor_resistance)
@@ -569,27 +308,120 @@ static void read_temperature(TimerHandle_t arg)
     }
 }
 
-static void read_tesla_led_task(void *pvParameters)
+/* static bool pcnt_on_reach_callback(pcnt_unit_handle_t unit, const pcnt_watch_event_data_t *edata, void *user_ctx)
 {
-    unsigned int voltage_mv =
-            read_adc_voltage(EXTERNAL_TESLA_LED_ADC1_CHANNEL, adc_cali_led_handle, do_calibration_led);
+    BaseType_t high_task_wakeup;
+    QueueHandle_t queue = (QueueHandle_t)user_ctx;
 
-    if (voltage_mv >= 50) {
-        set_flag(&general_flags, TESLA_LED_IS_TURNED_ON);
-    } else {
-        if (read_flag(general_flags, TESLA_LED_IS_TURNED_ON) && is_steering_wheel_turned_on()) {
-            blocking_beep(2);
-        }
+    // send event data to queue, from this interrupt callback
+    xQueueSendFromISR(queue, &(edata->watch_point_value), &high_task_wakeup);
 
-        reset_flag(&general_flags, TESLA_LED_IS_TURNED_ON);
-    }
-
-    vTaskDelete(NULL);
+    return (high_task_wakeup == pdTRUE);
 }
 
-static void read_tesla_led()
+static void external_led_pwm_config()
 {
-    xTaskCreate(&read_tesla_led_task, "read_tesla_led", 3 * 1024, NULL, 2, NULL);
+    // install pcnt unit
+    pcnt_unit_config_t unit_config = {
+        .high_limit = EXTERNAL_LED_PWM_PCNT_HIGH_LIMIT,
+        .low_limit = EXTERNAL_LED_PWM_PCNT_LOW_LIMIT,
+    };
+    ESP_ERROR_CHECK(pcnt_new_unit(&unit_config, &pcnt_unit));
+
+    // set glitch filter
+    pcnt_glitch_filter_config_t filter_config = {
+        .max_glitch_ns = 1000,
+    };
+    ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(pcnt_unit, &filter_config));
+
+    // install pcnt channels
+    pcnt_chan_config_t chan_a_config = {
+        .edge_gpio_num = 0,//EXAMPLE_EC11_GPIO_A,
+        .level_gpio_num = 0//EXAMPLE_EC11_GPIO_B,
+    };
+    pcnt_channel_handle_t pcnt_chan_a = NULL;
+    ESP_ERROR_CHECK(pcnt_new_channel(pcnt_unit, &chan_a_config, &pcnt_chan_a));
+    pcnt_chan_config_t chan_b_config = {
+        .edge_gpio_num = 0,//EXAMPLE_EC11_GPIO_B,
+        .level_gpio_num = 0//EXAMPLE_EC11_GPIO_A,
+    };
+    pcnt_channel_handle_t pcnt_chan_b = NULL;
+    ESP_ERROR_CHECK(pcnt_new_channel(pcnt_unit, &chan_b_config, &pcnt_chan_b));
+
+    // set edge and level actions for pcnt channels
+    // decrease the counter on rising edge, increase the counter on falling edge
+    ESP_ERROR_CHECK(pcnt_channel_set_edge_action(pcnt_chan_a, PCNT_CHANNEL_EDGE_ACTION_DECREASE, PCNT_CHANNEL_EDGE_ACTION_INCREASE));
+    // keep the counting mode when the control signal is high level, and reverse the counting mode when the control signal is low level
+    ESP_ERROR_CHECK(pcnt_channel_set_level_action(pcnt_chan_a, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE));
+
+    // add watch points and register callbacks
+    int watch_points[] = {EXTERNAL_LED_PWM_PCNT_LOW_LIMIT, -50, 0, 50, EXTERNAL_LED_PWM_PCNT_HIGH_LIMIT};
+    for (size_t i = 0; i < sizeof(watch_points) / sizeof(watch_points[0]); i++) {
+        ESP_ERROR_CHECK(pcnt_unit_add_watch_point(pcnt_unit, watch_points[i]));
+    }
+    pcnt_event_callbacks_t cbs = {
+        .on_reach = pcnt_on_reach_callback,
+    };
+    pcnt_queue = xQueueCreate(10, sizeof(int));
+    ESP_ERROR_CHECK(pcnt_unit_register_event_callbacks(pcnt_unit, &cbs, pcnt_queue));
+
+    // enable pcnt unit
+    ESP_ERROR_CHECK(pcnt_unit_enable(pcnt_unit));
+    //clear pcnt unit
+    ESP_ERROR_CHECK(pcnt_unit_clear_count(pcnt_unit));
+    // start pcnt unit
+    ESP_ERROR_CHECK(pcnt_unit_start(pcnt_unit));
+} */
+
+static bool external_led_pwm_callback(mcpwm_cap_channel_handle_t cap_chan, const mcpwm_capture_event_data_t *edata, void *user_data)
+{
+    static uint32_t cap_val_prev = 0;
+
+    external_led_pwm_ticks = edata->cap_value - cap_val_prev;
+    cap_val_prev = edata->cap_value;
+
+    // Reset
+    gptimer_set_raw_count(gptimer, 0);
+    return true;
+}
+
+static void external_led_pwm_config()
+{
+    // Install capture timer
+    mcpwm_cap_timer_handle_t cap_timer = NULL;
+    mcpwm_capture_timer_config_t cap_conf = {
+        .clk_src = MCPWM_CAPTURE_CLK_SRC_DEFAULT,
+        .group_id = 0,
+        // In ESP32, the parameter is invalid, the capture timer resolution is always equal to the MCPWM_CAPTURE_CLK_SRC_APB
+        //.resolution_hz 
+    };
+    ESP_ERROR_CHECK(mcpwm_new_capture_timer(&cap_conf, &cap_timer));
+
+    // Install capture channel
+    mcpwm_cap_channel_handle_t cap_chan = NULL;
+    mcpwm_capture_channel_config_t cap_ch_conf = {
+        .gpio_num = GPIO_INPUT_IO_EXTERNAL_LED_PWM,
+        .prescale = 1,
+        // capture on pos edge only
+        .flags.neg_edge = false,
+        .flags.pos_edge = true,
+        // pull up internally
+        .flags.pull_up = false
+    };
+    ESP_ERROR_CHECK(mcpwm_new_capture_channel(cap_timer, &cap_ch_conf, &cap_chan));
+
+    // Register capture callback
+    mcpwm_capture_event_callbacks_t cbs = {
+        .on_cap = external_led_pwm_callback
+    };
+    ESP_ERROR_CHECK(mcpwm_capture_channel_register_event_callbacks(cap_chan, &cbs, NULL));
+
+    // Enable capture channel
+    ESP_ERROR_CHECK(mcpwm_capture_channel_enable(cap_chan));
+
+    // Enable and start capture timer
+    ESP_ERROR_CHECK(mcpwm_capture_timer_enable(cap_timer));
+    ESP_ERROR_CHECK(mcpwm_capture_timer_start(cap_timer));
 }
 
 static void pins_config()
@@ -617,14 +449,40 @@ static void pins_config()
     io_diag_conf.pull_up_en = GPIO_PULLUP_ENABLE;
     gpio_config(&io_diag_conf);
 
-    // Replaced by ADC read because of variable voltage LED
-    /* gpio_config_t io_input_conf = {};
-    io_input_conf.intr_type = GPIO_INTR_DISABLE;
-    io_input_conf.mode = GPIO_MODE_INPUT;
-    io_input_conf.pin_bit_mask = (1ULL<<GPIO_INPUT_IO_EXTERNAL_LED);
-    io_input_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io_input_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-    gpio_config(&io_input_conf); */
+    external_led_pwm_config();
+}
+
+static bool IRAM_ATTR timer_on_alarm_callback(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data)
+{
+    external_led_pwm_ticks = 0;
+    return true;
+}
+
+static void timers_config()
+{
+    // Create timer handle
+    gptimer_config_t timer_config = {
+        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+        .direction = GPTIMER_COUNT_UP,
+        .resolution_hz = 10000 // 10kHz, 1 tick=100us=0.1ms
+    };
+    ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &gptimer));
+
+    gptimer_event_callbacks_t cbs = {
+        .on_alarm = timer_on_alarm_callback
+    };
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(gptimer, &cbs, NULL));
+
+    // Enable timer
+    ESP_ERROR_CHECK(gptimer_enable(gptimer));
+
+    gptimer_alarm_config_t alarm_config = {
+        .reload_count = 0,
+        .alarm_count = 10000, // period = 1s
+        .flags.auto_reload_on_alarm = true
+    };
+    ESP_ERROR_CHECK(gptimer_set_alarm_action(gptimer, &alarm_config));
+    ESP_ERROR_CHECK(gptimer_start(gptimer));
 }
 
 // ADC Calibration
@@ -695,11 +553,9 @@ static void adc_init()
     };
 
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, TEMPERATURE_SENSOR_ADC1_CHANNEL, &config));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, EXTERNAL_TESLA_LED_ADC1_CHANNEL, &config));
 
     //-------------ADC1 Calibration Init---------------//
     do_calibration_temperature_sensor = adc_calibration_init(ADC_UNIT_1, TEMPERATURE_SENSOR_ADC1_CHANNEL, ADC_ATTEN, &adc_cali_temperature_sensor_handle);
-    do_calibration_led = adc_calibration_init(ADC_UNIT_1, EXTERNAL_TESLA_LED_ADC1_CHANNEL, ADC_ATTEN, &adc_cali_led_handle);
 }
 
 // Enable configUSE_TRACE_FACILITY, configUSE_STATS_FORMATTING_FUNCTIONS, xCoreID
@@ -730,31 +586,8 @@ static bool diagnostic(void)
     return diagnostic_is_ok;
 }
 
-static void bt_init()
-{
-    ESP_LOGI(TAG, "Setting HID gap, mode: %d", HID_HOST_MODE);
-    ESP_ERROR_CHECK( esp_hid_gap_init(HID_HOST_MODE) );
-
-#if CONFIG_BT_BLE_ENABLED
-    ESP_ERROR_CHECK( esp_ble_gattc_register_callback(esp_hidh_gattc_event_handler) );
-#endif /* CONFIG_BT_BLE_ENABLED */
-
-    esp_hidh_config_t config = {
-        .callback = hidh_callback,
-        .event_stack_size = 3 * 1024,
-        .callback_arg = NULL,
-    };
-
-    ESP_ERROR_CHECK(esp_hidh_init(&config));
-}
-
 void app_main(void)
 {
-#if HID_HOST_MODE == HIDH_IDLE_MODE
-    ESP_LOGE(TAG, "Please turn on BT HID host or BLE!");
-    return;
-#endif
-
     uint8_t sha_256[HASH_LEN] = { 0 };
     esp_partition_t partition;
 
@@ -777,6 +610,7 @@ void app_main(void)
     print_sha256(sha_256, "SHA-256 for current firmware: ");
 
     pins_config();
+    timers_config();
 
     const esp_partition_t *running = esp_ota_get_running_partition();
     esp_ota_img_states_t ota_state;
@@ -811,21 +645,10 @@ void app_main(void)
     blocking_beep(3);
 
     adc_init();
-    bt_init();
-
-    check_input_led_state_and_scan_bt(NULL);
-
-    int scan_bt_timer_tmr_id = 0;
-    scan_bt_timer = xTimerCreate("scan_bt_timer", (10000 / portTICK_PERIOD_MS), pdTRUE, (void *) &scan_bt_timer_tmr_id, check_input_led_state_and_scan_bt);
-    xTimerStart(scan_bt_timer, portMAX_DELAY);
 
     int temperature_read_timer_tmr_id = 1;
     temperature_read_timer = xTimerCreate("temperature_read_timer", (5000 / portTICK_PERIOD_MS), pdTRUE, (void *) &temperature_read_timer_tmr_id, read_temperature);
     xTimerStart(temperature_read_timer, portMAX_DELAY);
-
-    int tesla_led_read_timer_tmr_id = 2;
-    tesla_led_read_timer = xTimerCreate("tesla_led_read_timer", (5000 / portTICK_PERIOD_MS), pdTRUE, (void *) &tesla_led_read_timer_tmr_id, read_tesla_led);
-    xTimerStart(tesla_led_read_timer, portMAX_DELAY);
 
 #if INCLUDE_xTaskGetHandle == 1 && configUSE_TRACE_FACILITY == 1
     while (1) {
@@ -835,4 +658,16 @@ void app_main(void)
         vTaskDelay(5000 / portTICK_PERIOD_MS);
     }
 #endif
+
+    uint32_t processor_frequency = (uint32_t)esp_clk_apb_freq();
+    
+    while (1) {
+        unsigned int pwm_frequency = (external_led_pwm_ticks > 0 && processor_frequency > external_led_pwm_ticks)
+                ? (processor_frequency / external_led_pwm_ticks)
+                : 0;
+
+        ESP_LOGI(TAG, "PWM frequency: %d", pwm_frequency);
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 }

@@ -40,6 +40,11 @@
     "task.h": "c",
     "wifi.h": "c",
     "esp_bt_main.h": "c",
-    "esp_gap_bt_api.h": "c"
+    "esp_gap_bt_api.h": "c",
+    "iterator": "c",
+    "beep.h": "c",
+    "gptimer.h": "c",
+    "pulse_cnt.h": "c",
+    "pcnt_types.h": "c"
   }
 }

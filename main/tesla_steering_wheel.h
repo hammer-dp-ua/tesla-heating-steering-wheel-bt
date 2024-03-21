@@ -11,7 +11,7 @@
  * */
 #define GPIO_OUTPUT_PIN_SEL ((1ULL<<GPIO_OUTPUT_IO_BUZZER) | (1ULL<<GPIO_OUTPUT_IO_TRANSISTOR) | (1ULL<<GPIO_OUTPUT_IO_LED))
 
-//#define GPIO_INPUT_IO_EXTERNAL_LED GPIO_NUM_10
+#define GPIO_INPUT_IO_EXTERNAL_LED_PWM GPIO_NUM_10
 
 #define STEERING_WHEEL_IS_TURNED_ON_FLAG        1 // Overall state
 #define STEERING_WHEEL_HEATING_IS_ACTIVE_FLAG   2 // Depends on current temperature
@@ -20,7 +20,6 @@
 #define TESLA_LED_IS_TURNED_ON                  16
 
 #define TEMPERATURE_SENSOR_ADC1_CHANNEL ADC_CHANNEL_2 // GPIO3
-#define EXTERNAL_TESLA_LED_ADC1_CHANNEL ADC_CHANNEL_9 // GPIO_NUM_10
 
 #define ADC_ATTEN ADC_ATTEN_DB_0 // Atten = 0, effective measurement range of 100 ∼ 950 mV
 #define ADC_SAMPLES 20
@@ -37,14 +36,6 @@ typedef enum {
     HEATING_TEMP_MIDDLE,
     HEATING_TEMP_HIGH
 } heating_temperature_t;
-
-struct bt_input_s {
-    bt_button_command_t button_candidate;
-    unsigned char validated_bytes_cnt;
-
-};
-
-typedef struct bt_input_s bt_input_t;
 
 void set_flag(unsigned int *flags, unsigned int flag);
 void reset_flag(unsigned int *flags, unsigned int flag);
