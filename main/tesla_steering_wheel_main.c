@@ -10,10 +10,13 @@
 #include "freertos/timers.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
+
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_sleep.h"
 #include "nvs_flash.h"
 
 #include "esp_adc/adc_oneshot.h"
@@ -30,15 +33,18 @@
 
 static const char *TAG = "TESLA_STEERING_WHEEL";
 
-static TimerHandle_t temperature_read_timer = NULL;
-
-static TaskHandle_t update_beep_task = NULL;
+static TaskHandle_t light_sleep_task_handle = NULL;
 
 static gptimer_handle_t gptimer = NULL;
 
+static mcpwm_cap_channel_handle_t mcpwm_cap_channel_handle = NULL;
+static mcpwm_cap_timer_handle_t mcpwm_cap_timer_handle = NULL;
+
 static heating_temperature_t heating_temperature = HEATING_TEMP_MIDDLE;
-    
-static unsigned int general_flags = 0;
+
+static SemaphoreHandle_t chip_sleep_semaphore = NULL;
+
+static uint32_t general_flags = 0;
 
 static adc_oneshot_unit_handle_t adc1_handle = NULL;
 static adc_cali_handle_t adc_cali_temperature_sensor_handle = NULL;
@@ -46,35 +52,54 @@ static bool do_calibration_temperature_sensor = false;
 
 static uint32_t external_led_pwm_ticks = 0;
 
-void set_flag(unsigned int *flags, unsigned int flag) {
-   *flags |= flag;
+void set_flag(uint32_t *flags, uint32_t flag)
+{
+    *flags |= flag;
 }
 
-void reset_flag(unsigned int *flags, unsigned int flag) {
-   *flags &= ~(*flags & flag);
+void reset_flag(uint32_t *flags, uint32_t flag)
+{
+    *flags &= ~(*flags & flag);
 }
 
-bool read_flag(unsigned int flags, unsigned int flag) {
-   return (flags & flag);
+bool read_flag(uint32_t flags, uint32_t flag)
+{
+    return (flags & flag);
+}
+
+static unsigned long utils_get_system_timestamp_ms()
+{
+    return esp_log_timestamp();
 }
 
 static void ota_event_handler(ota_status_t ota_status, unsigned char error_number)
 {
     if (ota_status == OTA_ERROR) {
-        vTaskDelete(update_beep_task);
-        update_beep_task = NULL;
-
         turn_beeper_off();
         vTaskDelay(1000 / portTICK_PERIOD_MS);
-        human_countable_blocking_beep(error_number);
+
+        beep_setting_t beep_settings = {
+            .beep_type = HUMAN_COUNTABLE,
+            .beeps = error_number,
+            .blocking_type = BLOCKING
+        };
+        beep(beep_settings);
 
         esp_wifi_disconnect();
+        xSemaphoreGive(chip_sleep_semaphore);
     } else if (ota_status == OTA_OK) {
-        vTaskDelete(update_beep_task);
-        blocking_single_beep_ms(2000);
+        beep_setting_t beep_settings = {
+            .beep_type = SINGLE_BEEP,
+            .blocking_type = BLOCKING,
+            .single_beep_duration_ms = 2000
+        };
+        beep(beep_settings);
     } else if (ota_status == OTA_START_DOWNLOADING) {
-        vTaskDelete(update_beep_task);
-        fast_infinite_beep(&update_beep_task);
+        beep_setting_t beep_settings = {
+            .beep_type = FAST_INFINITE_BEEPS,
+            .blocking_type = NON_BLOCKING
+        };
+        beep(beep_settings);
     }
 }
 
@@ -89,10 +114,6 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         reset_flag(&general_flags, WIFI_CONNECTED_FLAG);
-
-        if (update_beep_task != NULL) {
-            vTaskDelete(update_beep_task);
-        }
 
         turn_beeper_off();
 
@@ -158,7 +179,12 @@ static void init_connect_to_wifi()
 
 static void update_software()
 {
-    infinite_beep(&update_beep_task);
+    beep_setting_t beep_settings = {
+        .beep_type = INFINITE_BEEPS,
+        .blocking_type = NON_BLOCKING
+    };
+    beep(beep_settings);
+
     vTaskDelay(2000 / portTICK_PERIOD_MS);
 
     if (read_flag(general_flags, WIFI_INITIALIZED_FLAG)) {
@@ -174,7 +200,13 @@ static void increase_heating_temperature()
         heating_temperature++;
     }
 
-    beep(heating_temperature);
+    beep_setting_t beep_settings = {
+        .beep_type = BEEPS,
+        .beeps = heating_temperature,
+        .blocking_type = NON_BLOCKING,
+        .chip_sleep_semaphore = chip_sleep_semaphore
+    };
+    beep(beep_settings);
 }
 
 static void decrease_heating_temperature()
@@ -183,7 +215,13 @@ static void decrease_heating_temperature()
         heating_temperature--;
     }
 
-    beep(heating_temperature);
+    beep_setting_t beep_settings = {
+        .beep_type = BEEPS,
+        .beeps = heating_temperature,
+        .blocking_type = NON_BLOCKING,
+        .chip_sleep_semaphore = chip_sleep_semaphore
+    };
+    beep(beep_settings);
 }
 
 static void turn_steering_wheel_off()
@@ -192,6 +230,7 @@ static void turn_steering_wheel_off()
     reset_flag(&general_flags, STEERING_WHEEL_HEATING_IS_ACTIVE_FLAG);
 
     gpio_set_level(GPIO_OUTPUT_IO_TRANSISTOR, 0);
+    gpio_hold_dis(GPIO_OUTPUT_IO_TRANSISTOR);
 }
 
 static void turn_steering_wheel_on()
@@ -204,14 +243,18 @@ static bool is_steering_wheel_turned_on()
     return read_flag(general_flags, STEERING_WHEEL_IS_TURNED_ON_FLAG);
 }
 
-static bool is_tesla_led_turned_on()
+static uint32_t get_pwm_frequency(uint32_t pwm_ticks)
 {
     uint32_t processor_frequency = (uint32_t)esp_clk_apb_freq();
-    unsigned int pwm_frequency = (external_led_pwm_ticks > 0 && processor_frequency > external_led_pwm_ticks)
-            ? (processor_frequency / external_led_pwm_ticks)
+    return (pwm_ticks > 0 && processor_frequency > pwm_ticks)
+            ? (uint32_t)(processor_frequency / pwm_ticks)
             : 0;
-    
-    return pwm_frequency > 200 && pwm_frequency < 300;
+}
+
+static bool is_tesla_led_turned_on()
+{
+    uint32_t pwm_frequency = get_pwm_frequency(external_led_pwm_ticks);
+    return pwm_frequency > (EXPECTED_PWM_LED_FREQUENCY_HZ - 50) && pwm_frequency < (EXPECTED_PWM_LED_FREQUENCY_HZ + 50);
 }
 
 static float calculate_ntc_temperature(float temp_sensor_resistance)
@@ -226,9 +269,9 @@ static float calculate_ntc_temperature(float temp_sensor_resistance)
     return temperature;
 }
 
-static unsigned int read_adc_voltage(adc_channel_t adc_channel, adc_cali_handle_t adc_cali_handle, bool do_calibration)
+static uint32_t read_adc_voltage(adc_channel_t adc_channel, adc_cali_handle_t adc_cali_handle, bool do_calibration)
 {
-    unsigned int voltage_accumulator = 0;
+    uint32_t voltage_accumulator = 0;
 
     for (unsigned char i = 0; i < ADC_SAMPLES; i++) {
         int adc_raw = 0;
@@ -245,14 +288,14 @@ static unsigned int read_adc_voltage(adc_channel_t adc_channel, adc_cali_handle_
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
     
-    unsigned int voltage_avarage_mv = voltage_accumulator / ADC_SAMPLES;
-    ESP_LOGI(TAG, "ADC calibration Voltage: %d mV", voltage_avarage_mv);
+    uint32_t voltage_avarage_mv = voltage_accumulator / ADC_SAMPLES;
+    ESP_LOGI(TAG, "ADC calibration Voltage: %d mV", (unsigned int)voltage_avarage_mv);
     return voltage_avarage_mv;
 }
 
-static void read_temperature_task(void *pvParameters)
+static void read_temperature_and_apply()
 {
-    unsigned int voltage_mv =
+    uint32_t voltage_mv =
             read_adc_voltage(TEMPERATURE_SENSOR_ADC1_CHANNEL, adc_cali_temperature_sensor_handle, do_calibration_temperature_sensor);
 
     float series_resistor_voltage = (float)voltage_mv / 1000.0f;
@@ -291,114 +334,64 @@ static void read_temperature_task(void *pvParameters)
 
     bool turn_heating_on = temp < expected_temperature;
     gpio_set_level(GPIO_OUTPUT_IO_TRANSISTOR, turn_heating_on);
+    
+    if (turn_heating_on) {
+        gpio_hold_en(GPIO_OUTPUT_IO_TRANSISTOR);
+    } else {
+        gpio_hold_dis(GPIO_OUTPUT_IO_TRANSISTOR);
+    }
 
     if (turn_heating_on) {
         set_flag(&general_flags, STEERING_WHEEL_HEATING_IS_ACTIVE_FLAG);
     } else {
         reset_flag(&general_flags, STEERING_WHEEL_HEATING_IS_ACTIVE_FLAG);
     }
-
-    vTaskDelete(NULL);
 }
-
-static void read_temperature(TimerHandle_t arg)
-{
-    if (is_steering_wheel_turned_on()) {
-        xTaskCreate(&read_temperature_task, "read_temperature", 3 * 1024, NULL, 2, NULL);
-    }
-}
-
-/* static bool pcnt_on_reach_callback(pcnt_unit_handle_t unit, const pcnt_watch_event_data_t *edata, void *user_ctx)
-{
-    BaseType_t high_task_wakeup;
-    QueueHandle_t queue = (QueueHandle_t)user_ctx;
-
-    // send event data to queue, from this interrupt callback
-    xQueueSendFromISR(queue, &(edata->watch_point_value), &high_task_wakeup);
-
-    return (high_task_wakeup == pdTRUE);
-}
-
-static void external_led_pwm_config()
-{
-    // install pcnt unit
-    pcnt_unit_config_t unit_config = {
-        .high_limit = EXTERNAL_LED_PWM_PCNT_HIGH_LIMIT,
-        .low_limit = EXTERNAL_LED_PWM_PCNT_LOW_LIMIT,
-    };
-    ESP_ERROR_CHECK(pcnt_new_unit(&unit_config, &pcnt_unit));
-
-    // set glitch filter
-    pcnt_glitch_filter_config_t filter_config = {
-        .max_glitch_ns = 1000,
-    };
-    ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(pcnt_unit, &filter_config));
-
-    // install pcnt channels
-    pcnt_chan_config_t chan_a_config = {
-        .edge_gpio_num = 0,//EXAMPLE_EC11_GPIO_A,
-        .level_gpio_num = 0//EXAMPLE_EC11_GPIO_B,
-    };
-    pcnt_channel_handle_t pcnt_chan_a = NULL;
-    ESP_ERROR_CHECK(pcnt_new_channel(pcnt_unit, &chan_a_config, &pcnt_chan_a));
-    pcnt_chan_config_t chan_b_config = {
-        .edge_gpio_num = 0,//EXAMPLE_EC11_GPIO_B,
-        .level_gpio_num = 0//EXAMPLE_EC11_GPIO_A,
-    };
-    pcnt_channel_handle_t pcnt_chan_b = NULL;
-    ESP_ERROR_CHECK(pcnt_new_channel(pcnt_unit, &chan_b_config, &pcnt_chan_b));
-
-    // set edge and level actions for pcnt channels
-    // decrease the counter on rising edge, increase the counter on falling edge
-    ESP_ERROR_CHECK(pcnt_channel_set_edge_action(pcnt_chan_a, PCNT_CHANNEL_EDGE_ACTION_DECREASE, PCNT_CHANNEL_EDGE_ACTION_INCREASE));
-    // keep the counting mode when the control signal is high level, and reverse the counting mode when the control signal is low level
-    ESP_ERROR_CHECK(pcnt_channel_set_level_action(pcnt_chan_a, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE));
-
-    // add watch points and register callbacks
-    int watch_points[] = {EXTERNAL_LED_PWM_PCNT_LOW_LIMIT, -50, 0, 50, EXTERNAL_LED_PWM_PCNT_HIGH_LIMIT};
-    for (size_t i = 0; i < sizeof(watch_points) / sizeof(watch_points[0]); i++) {
-        ESP_ERROR_CHECK(pcnt_unit_add_watch_point(pcnt_unit, watch_points[i]));
-    }
-    pcnt_event_callbacks_t cbs = {
-        .on_reach = pcnt_on_reach_callback,
-    };
-    pcnt_queue = xQueueCreate(10, sizeof(int));
-    ESP_ERROR_CHECK(pcnt_unit_register_event_callbacks(pcnt_unit, &cbs, pcnt_queue));
-
-    // enable pcnt unit
-    ESP_ERROR_CHECK(pcnt_unit_enable(pcnt_unit));
-    //clear pcnt unit
-    ESP_ERROR_CHECK(pcnt_unit_clear_count(pcnt_unit));
-    // start pcnt unit
-    ESP_ERROR_CHECK(pcnt_unit_start(pcnt_unit));
-} */
 
 static bool external_led_pwm_callback(mcpwm_cap_channel_handle_t cap_chan, const mcpwm_capture_event_data_t *edata, void *user_data)
 {
     static uint32_t cap_val_prev = 0;
+    static unsigned char callback_counter = 0;
+
+    if (edata->cap_value == 0) {
+        return false;
+    }
+
+    BaseType_t task_wakeup = pdFALSE;
+
+    callback_counter++;
 
     external_led_pwm_ticks = edata->cap_value - cap_val_prev;
     cap_val_prev = edata->cap_value;
 
-    // Reset
-    gptimer_set_raw_count(gptimer, 0);
-    return true;
+    if (callback_counter >= PWM_LED_MISURE_CYCLES) {
+        ESP_ERROR_CHECK(mcpwm_capture_channel_disable(mcpwm_cap_channel_handle));
+        ESP_ERROR_CHECK(mcpwm_capture_timer_stop(mcpwm_cap_timer_handle));
+        ESP_ERROR_CHECK(mcpwm_capture_timer_disable(mcpwm_cap_timer_handle));
+
+        reset_flag(&general_flags, MCPWM_ENABLED_FLAG);
+
+        cap_val_prev = 0;
+        callback_counter = 0;
+
+        xTaskNotifyFromISR(light_sleep_task_handle, NULL, eSetValueWithOverwrite, &task_wakeup);
+    }
+    
+    return task_wakeup == pdTRUE;
 }
 
 static void external_led_pwm_config()
 {
     // Install capture timer
-    mcpwm_cap_timer_handle_t cap_timer = NULL;
     mcpwm_capture_timer_config_t cap_conf = {
         .clk_src = MCPWM_CAPTURE_CLK_SRC_DEFAULT,
         .group_id = 0,
         // In ESP32, the parameter is invalid, the capture timer resolution is always equal to the MCPWM_CAPTURE_CLK_SRC_APB
         //.resolution_hz 
     };
-    ESP_ERROR_CHECK(mcpwm_new_capture_timer(&cap_conf, &cap_timer));
+    ESP_ERROR_CHECK(mcpwm_new_capture_timer(&cap_conf, &mcpwm_cap_timer_handle));
 
     // Install capture channel
-    mcpwm_cap_channel_handle_t cap_chan = NULL;
     mcpwm_capture_channel_config_t cap_ch_conf = {
         .gpio_num = GPIO_INPUT_IO_EXTERNAL_LED_PWM,
         .prescale = 1,
@@ -408,20 +401,47 @@ static void external_led_pwm_config()
         // pull up internally
         .flags.pull_up = false
     };
-    ESP_ERROR_CHECK(mcpwm_new_capture_channel(cap_timer, &cap_ch_conf, &cap_chan));
+    ESP_ERROR_CHECK(mcpwm_new_capture_channel(mcpwm_cap_timer_handle, &cap_ch_conf, &mcpwm_cap_channel_handle));
 
     // Register capture callback
     mcpwm_capture_event_callbacks_t cbs = {
         .on_cap = external_led_pwm_callback
     };
-    ESP_ERROR_CHECK(mcpwm_capture_channel_register_event_callbacks(cap_chan, &cbs, NULL));
+    ESP_ERROR_CHECK(mcpwm_capture_channel_register_event_callbacks(mcpwm_cap_channel_handle, &cbs, NULL));
 
     // Enable capture channel
-    ESP_ERROR_CHECK(mcpwm_capture_channel_enable(cap_chan));
+    //ESP_ERROR_CHECK(mcpwm_capture_channel_enable(mcpwm_cap_channel_handle));
 
-    // Enable and start capture timer
-    ESP_ERROR_CHECK(mcpwm_capture_timer_enable(cap_timer));
-    ESP_ERROR_CHECK(mcpwm_capture_timer_start(cap_timer));
+    // Enable capture timer
+    //ESP_ERROR_CHECK(mcpwm_capture_timer_enable(mcpwm_cap_timer_handle));
+}
+
+static void wait_gpio_inactive(void)
+{
+    while (gpio_get_level(GPIO_WAKEUP_NUM) == GPIO_WAKEUP_LEVEL) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+static esp_err_t register_gpio_wakeup(void)
+{
+    /* Initialize GPIO */
+    gpio_config_t config = {
+            .pin_bit_mask = BIT64(GPIO_WAKEUP_NUM),
+            .mode = GPIO_MODE_INPUT,
+            .pull_down_en = false,
+            .pull_up_en = false,
+            .intr_type = GPIO_INTR_DISABLE
+    };
+    ESP_ERROR_CHECK(gpio_config(&config));
+
+    /* Enable wake up from GPIO */
+    ESP_ERROR_CHECK(gpio_wakeup_enable(GPIO_WAKEUP_NUM, GPIO_WAKEUP_LEVEL == 0 ? GPIO_INTR_LOW_LEVEL : GPIO_INTR_HIGH_LEVEL));
+    ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup());
+
+    /* Make sure the GPIO is inactive and it won't trigger wakeup immediately */
+    wait_gpio_inactive();
+    return ESP_OK;
 }
 
 static void pins_config()
@@ -444,17 +464,15 @@ static void pins_config()
     gpio_config_t io_diag_conf = {};
     io_diag_conf.intr_type = GPIO_INTR_DISABLE;
     io_diag_conf.mode = GPIO_MODE_OUTPUT;
-    io_diag_conf.pin_bit_mask = (1ULL<<GPIO_OUTPUT_IO_DIAGNOSTIC);
+    io_diag_conf.pin_bit_mask = BIT64(GPIO_OUTPUT_IO_DIAGNOSTIC);
     io_diag_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     io_diag_conf.pull_up_en = GPIO_PULLUP_ENABLE;
     gpio_config(&io_diag_conf);
-
-    external_led_pwm_config();
 }
 
 static bool IRAM_ATTR timer_on_alarm_callback(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data)
 {
-    external_led_pwm_ticks = 0;
+    //external_led_pwm_ticks = 0;
     return true;
 }
 
@@ -478,7 +496,7 @@ static void timers_config()
 
     gptimer_alarm_config_t alarm_config = {
         .reload_count = 0,
-        .alarm_count = 10000, // period = 1s
+        .alarm_count = 10000, // period = 1s (0.1ms * 10000)
         .flags.auto_reload_on_alarm = true
     };
     ESP_ERROR_CHECK(gptimer_set_alarm_action(gptimer, &alarm_config));
@@ -569,7 +587,7 @@ static void get_debug_task_info(char *task_name)
     vTaskGetInfo(xHandle, &xTaskDetails, pdTRUE, eInvalid );
     ESP_LOGI(TAG, "Task '%s'. Stack high water mark: %u. Task number: %u",
             xTaskDetails.pcTaskName,
-            (unsigned int)xTaskDetails.usStackHighWaterMark,
+            (uint32_t)xTaskDetails.usStackHighWaterMark,
             xTaskDetails.xTaskNumber);
 }
 #endif
@@ -584,6 +602,119 @@ static bool diagnostic(void)
 
     gpio_reset_pin(GPIO_OUTPUT_IO_DIAGNOSTIC);
     return diagnostic_is_ok;
+}
+
+static void light_sleep_task(void *args)
+{
+    float expected_pwm_led_cycle_sec = 1.0f / (float)EXPECTED_PWM_LED_FREQUENCY_HZ;
+    uint32_t time_to_wait_for_pwm_led_measurement_ms = (uint32_t)(2.0f * 1000.0f * (float)PWM_LED_MISURE_CYCLES * expected_pwm_led_cycle_sec);
+
+    bool turning_on = false;
+    
+    while (true) {
+        xSemaphoreTake(chip_sleep_semaphore, portMAX_DELAY);
+
+        /* Enter sleep mode */
+        esp_light_sleep_start();
+        //vTaskDelay(pdMS_TO_TICKS(5000));
+        xSemaphoreGive(chip_sleep_semaphore);
+
+        unsigned long button_pressed_time_ms = 0;
+
+        /* Determine wake up reason */
+        const char* wakeup_reason;
+        switch (esp_sleep_get_wakeup_cause()) {
+            case ESP_SLEEP_WAKEUP_TIMER:
+                wakeup_reason = "timer";
+                break;
+            case ESP_SLEEP_WAKEUP_GPIO:
+                wakeup_reason = "pin";
+                button_pressed_time_ms = utils_get_system_timestamp_ms();
+                break;
+            case ESP_SLEEP_WAKEUP_UART:
+                wakeup_reason = "uart";
+                /* Hang-up for a while to switch and execuse the uart task
+                 * Otherwise the chip may fall sleep again before running uart task */
+                vTaskDelay(1);
+                break;
+#if CONFIG_IDF_TARGET_ESP32S2 || CONFIG_IDF_TARGET_ESP32S3
+            case ESP_SLEEP_WAKEUP_TOUCHPAD:
+                wakeup_reason = "touch";
+                break;
+#endif
+            default:
+                wakeup_reason = "other";
+                break;
+        }
+
+        ESP_LOGI(TAG, "Returned from light sleep, reason: %s", wakeup_reason);
+
+        if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) {
+            /* Waiting for the gpio inactive, or the chip will continously trigger wakeup*/
+            wait_gpio_inactive();
+
+            if (utils_get_system_timestamp_ms() - button_pressed_time_ms >= 3000) {
+                beep_setting_t beep_setting = {
+                    .beep_type = BEEPS,
+                    .beeps = 3,
+                    .blocking_type = NON_BLOCKING,
+                    .chip_sleep_semaphore = chip_sleep_semaphore
+                };
+                beep(beep_setting);
+
+                //create_ota_task();
+            } else {
+                if (is_steering_wheel_turned_on()) {
+                    turn_steering_wheel_off();
+
+                    beep_setting_t beep_setting = {
+                        .beep_type = BEEPS,
+                        .beeps = 2,
+                        .blocking_type = BLOCKING
+                    };
+                    beep(beep_setting);
+                } else {
+                    turn_steering_wheel_on();
+                    turning_on = true;
+                }
+            }
+        }
+
+        if (!is_steering_wheel_turned_on()) {
+            continue;
+        }
+
+        if (!read_flag(general_flags, MCPWM_ENABLED_FLAG)) {
+            ESP_ERROR_CHECK(mcpwm_capture_channel_enable(mcpwm_cap_channel_handle));
+            ESP_ERROR_CHECK(mcpwm_capture_timer_enable(mcpwm_cap_timer_handle));
+            ESP_ERROR_CHECK(mcpwm_capture_timer_start(mcpwm_cap_timer_handle));
+
+            set_flag(&general_flags, MCPWM_ENABLED_FLAG);
+        }
+        
+        if (xTaskNotifyWait(0x00, ULONG_MAX, NULL, pdMS_TO_TICKS(time_to_wait_for_pwm_led_measurement_ms)) == pdTRUE) {
+            if (is_tesla_led_turned_on()) {
+                if (turning_on) {
+                    beep_setting_t beep_setting = {
+                        .beep_type = BEEPS,
+                        .beeps = 1,
+                        .blocking_type = BLOCKING
+                    };
+                    beep(beep_setting);
+                }
+
+                turning_on = false;
+            } else {
+                turn_steering_wheel_off();
+                continue;
+            }
+        } else {
+            turn_steering_wheel_off();
+            continue;
+        }
+
+        read_temperature_and_apply();
+    }
 }
 
 void app_main(void)
@@ -610,7 +741,12 @@ void app_main(void)
     print_sha256(sha_256, "SHA-256 for current firmware: ");
 
     pins_config();
-    timers_config();
+    external_led_pwm_config();
+    register_gpio_wakeup();
+
+    //ESP_ERROR_CHECK(rtc_gpio_set_direction(GPIO_OUTPUT_IO_TRANSISTOR, RTC_GPIO_MODE_OUTPUT_ONLY));
+    //ESP_ERROR_CHECK(esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON));
+    //timers_config();
 
     const esp_partition_t *running = esp_ota_get_running_partition();
     esp_ota_img_states_t ota_state;
@@ -623,7 +759,6 @@ void app_main(void)
             if (diagnostic_is_ok) {
                 ESP_LOGI(TAG, "Diagnostics completed successfully! Continuing execution ...");
                 esp_ota_mark_app_valid_cancel_rollback();
-                blocking_beep(2);
             } else {
                 ESP_LOGE(TAG, "Diagnostics failed! Start rollback to the previous version ...");
                 esp_ota_mark_app_invalid_rollback_and_reboot();
@@ -642,13 +777,20 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
-    blocking_beep(3);
+    beep_setting_t beep_setting = {
+        .beep_type = BEEPS,
+        .beeps = 1,
+        .blocking_type = BLOCKING
+    };
+    beep(beep_setting);
 
     adc_init();
+    
+    ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(TIMER_WAKEUP_TIME_US));
 
-    int temperature_read_timer_tmr_id = 1;
-    temperature_read_timer = xTimerCreate("temperature_read_timer", (5000 / portTICK_PERIOD_MS), pdTRUE, (void *) &temperature_read_timer_tmr_id, read_temperature);
-    xTimerStart(temperature_read_timer, portMAX_DELAY);
+    //int temperature_read_timer_tmr_id = 1;
+    //temperature_read_timer = xTimerCreate("temperature_read_timer", (5000 / portTICK_PERIOD_MS), pdTRUE, (void *) &temperature_read_timer_tmr_id, read_temperature);
+    //xTimerStart(temperature_read_timer, portMAX_DELAY);
 
 #if INCLUDE_xTaskGetHandle == 1 && configUSE_TRACE_FACILITY == 1
     while (1) {
@@ -659,15 +801,20 @@ void app_main(void)
     }
 #endif
 
-    uint32_t processor_frequency = (uint32_t)esp_clk_apb_freq();
+    //uint32_t processor_frequency = (uint32_t)esp_clk_apb_freq();
     
-    while (1) {
-        unsigned int pwm_frequency = (external_led_pwm_ticks > 0 && processor_frequency > external_led_pwm_ticks)
+    /* while (1) {
+        uint32_t pwm_frequency = (external_led_pwm_ticks > 0 && processor_frequency > external_led_pwm_ticks)
                 ? (processor_frequency / external_led_pwm_ticks)
                 : 0;
 
         ESP_LOGI(TAG, "PWM frequency: %d", pwm_frequency);
 
         vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+    } */
+
+    chip_sleep_semaphore = xSemaphoreCreateBinary();
+    xSemaphoreGive(chip_sleep_semaphore);
+
+    xTaskCreate(light_sleep_task, "light_sleep", 4 * 1024, NULL, 2, &light_sleep_task_handle);
 }

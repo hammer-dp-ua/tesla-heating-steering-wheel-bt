@@ -45,6 +45,7 @@
     "beep.h": "c",
     "gptimer.h": "c",
     "pulse_cnt.h": "c",
-    "pcnt_types.h": "c"
+    "pcnt_types.h": "c",
+    "esp_clk.h": "c"
   }
 }

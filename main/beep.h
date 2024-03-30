@@ -1,14 +1,29 @@
-#define INFINITE_BEEP 0xFE
-#define FAST_INFINITE_BEEP 0xFD
+#include "freertos/semphr.h"
 
 #define BUZZER_PIN GPIO_NUM_18
 
-void human_countable_blocking_beep(unsigned int beeps);
-void blocking_beep(unsigned int beeps);
-void blocking_single_beep_ms(unsigned int duration_ms);
-void long_blocking_beep();
-void beep(unsigned int beeps);
-void single_beep_ms(unsigned int duration_ms);
-void infinite_beep(TaskHandle_t * pxCreatedTask);
-void fast_infinite_beep(TaskHandle_t * pxCreatedTask);
+typedef enum {
+    BLOCKING,
+    NON_BLOCKING
+} block_t;
+
+typedef enum {
+    BEEPS,
+    SINGLE_BEEP,
+    INFINITE_BEEPS,
+    FAST_INFINITE_BEEPS,
+    HUMAN_COUNTABLE
+} beep_type_t;
+
+struct beep_setting_s {
+    beep_type_t beep_type;
+    unsigned int beeps;
+    block_t blocking_type;
+    unsigned int single_beep_duration_ms;
+    SemaphoreHandle_t chip_sleep_semaphore;
+};
+
+typedef struct beep_setting_s beep_setting_t;
+
+void beep(beep_setting_t beep_setting);
 void turn_beeper_off();
