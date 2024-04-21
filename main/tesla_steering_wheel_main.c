@@ -67,7 +67,7 @@ bool read_flag(uint32_t flags, uint32_t flag)
     return (flags & flag);
 }
 
-static unsigned long utils_get_system_timestamp_ms()
+static uint32_t utils_get_system_timestamp_ms()
 {
     return esp_log_timestamp();
 }
@@ -353,10 +353,6 @@ static bool external_led_pwm_callback(mcpwm_cap_channel_handle_t cap_chan, const
     static uint32_t cap_val_prev = 0;
     static unsigned char callback_counter = 0;
 
-    if (edata->cap_value == 0) {
-        return false;
-    }
-
     BaseType_t task_wakeup = pdFALSE;
 
     callback_counter++;
@@ -393,13 +389,11 @@ static void external_led_pwm_config()
 
     // Install capture channel
     mcpwm_capture_channel_config_t cap_ch_conf = {
-        .gpio_num = GPIO_INPUT_IO_EXTERNAL_LED_PWM,
+        .gpio_num = GPIO_INPUT_TESLA_PIN_16_LED_PWM,
         .prescale = 1,
-        // capture on pos edge only
-        .flags.neg_edge = false,
+        .flags.neg_edge = false, // capture on pos edge only
         .flags.pos_edge = true,
-        // pull up internally
-        .flags.pull_up = false
+        .flags.pull_up = false // not to pull up internally
     };
     ESP_ERROR_CHECK(mcpwm_new_capture_channel(mcpwm_cap_timer_handle, &cap_ch_conf, &mcpwm_cap_channel_handle));
 
@@ -408,12 +402,6 @@ static void external_led_pwm_config()
         .on_cap = external_led_pwm_callback
     };
     ESP_ERROR_CHECK(mcpwm_capture_channel_register_event_callbacks(mcpwm_cap_channel_handle, &cbs, NULL));
-
-    // Enable capture channel
-    //ESP_ERROR_CHECK(mcpwm_capture_channel_enable(mcpwm_cap_channel_handle));
-
-    // Enable capture timer
-    //ESP_ERROR_CHECK(mcpwm_capture_timer_enable(mcpwm_cap_timer_handle));
 }
 
 static void wait_gpio_inactive(void)
@@ -468,39 +456,6 @@ static void pins_config()
     io_diag_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     io_diag_conf.pull_up_en = GPIO_PULLUP_ENABLE;
     gpio_config(&io_diag_conf);
-}
-
-static bool IRAM_ATTR timer_on_alarm_callback(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data)
-{
-    //external_led_pwm_ticks = 0;
-    return true;
-}
-
-static void timers_config()
-{
-    // Create timer handle
-    gptimer_config_t timer_config = {
-        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
-        .direction = GPTIMER_COUNT_UP,
-        .resolution_hz = 10000 // 10kHz, 1 tick=100us=0.1ms
-    };
-    ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &gptimer));
-
-    gptimer_event_callbacks_t cbs = {
-        .on_alarm = timer_on_alarm_callback
-    };
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(gptimer, &cbs, NULL));
-
-    // Enable timer
-    ESP_ERROR_CHECK(gptimer_enable(gptimer));
-
-    gptimer_alarm_config_t alarm_config = {
-        .reload_count = 0,
-        .alarm_count = 10000, // period = 1s (0.1ms * 10000)
-        .flags.auto_reload_on_alarm = true
-    };
-    ESP_ERROR_CHECK(gptimer_set_alarm_action(gptimer, &alarm_config));
-    ESP_ERROR_CHECK(gptimer_start(gptimer));
 }
 
 // ADC Calibration
@@ -616,10 +571,9 @@ static void light_sleep_task(void *args)
 
         /* Enter sleep mode */
         esp_light_sleep_start();
-        //vTaskDelay(pdMS_TO_TICKS(5000));
         xSemaphoreGive(chip_sleep_semaphore);
 
-        unsigned long button_pressed_time_ms = 0;
+        uint32_t button_pressed_time_ms = 0;
 
         /* Determine wake up reason */
         const char* wakeup_reason;
@@ -653,16 +607,8 @@ static void light_sleep_task(void *args)
             /* Waiting for the gpio inactive, or the chip will continously trigger wakeup*/
             wait_gpio_inactive();
 
-            if (utils_get_system_timestamp_ms() - button_pressed_time_ms >= 3000) {
-                beep_setting_t beep_setting = {
-                    .beep_type = BEEPS,
-                    .beeps = 3,
-                    .blocking_type = NON_BLOCKING,
-                    .chip_sleep_semaphore = chip_sleep_semaphore
-                };
-                beep(beep_setting);
-
-                //create_ota_task();
+            if ((utils_get_system_timestamp_ms() - button_pressed_time_ms) >= 3000) {
+                create_ota_task();
             } else {
                 if (is_steering_wheel_turned_on()) {
                     turn_steering_wheel_off();
@@ -701,9 +647,9 @@ static void light_sleep_task(void *args)
                         .blocking_type = BLOCKING
                     };
                     beep(beep_setting);
-                }
 
-                turning_on = false;
+                    turning_on = false;
+                }
             } else {
                 turn_steering_wheel_off();
                 continue;
@@ -743,10 +689,6 @@ void app_main(void)
     pins_config();
     external_led_pwm_config();
     register_gpio_wakeup();
-
-    //ESP_ERROR_CHECK(rtc_gpio_set_direction(GPIO_OUTPUT_IO_TRANSISTOR, RTC_GPIO_MODE_OUTPUT_ONLY));
-    //ESP_ERROR_CHECK(esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON));
-    //timers_config();
 
     const esp_partition_t *running = esp_ota_get_running_partition();
     esp_ota_img_states_t ota_state;
@@ -788,10 +730,6 @@ void app_main(void)
     
     ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(TIMER_WAKEUP_TIME_US));
 
-    //int temperature_read_timer_tmr_id = 1;
-    //temperature_read_timer = xTimerCreate("temperature_read_timer", (5000 / portTICK_PERIOD_MS), pdTRUE, (void *) &temperature_read_timer_tmr_id, read_temperature);
-    //xTimerStart(temperature_read_timer, portMAX_DELAY);
-
 #if INCLUDE_xTaskGetHandle == 1 && configUSE_TRACE_FACILITY == 1
     while (1) {
         get_debug_task_info("BTU_TASK");
@@ -800,18 +738,6 @@ void app_main(void)
         vTaskDelay(5000 / portTICK_PERIOD_MS);
     }
 #endif
-
-    //uint32_t processor_frequency = (uint32_t)esp_clk_apb_freq();
-    
-    /* while (1) {
-        uint32_t pwm_frequency = (external_led_pwm_ticks > 0 && processor_frequency > external_led_pwm_ticks)
-                ? (processor_frequency / external_led_pwm_ticks)
-                : 0;
-
-        ESP_LOGI(TAG, "PWM frequency: %d", pwm_frequency);
-
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    } */
 
     chip_sleep_semaphore = xSemaphoreCreateBinary();
     xSemaphoreGive(chip_sleep_semaphore);
