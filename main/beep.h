@@ -1,4 +1,5 @@
 #include "freertos/semphr.h"
+#include "esp_pm.h"
 
 #define BUZZER_PIN GPIO_NUM_18
 

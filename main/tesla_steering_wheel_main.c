@@ -25,6 +25,7 @@
 #include "driver/mcpwm_cap.h"
 #include "driver/gptimer.h"
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
 
 #include "tesla_steering_wheel.h"
 #include "ota.h"
@@ -86,7 +87,8 @@ static void ota_event_handler(ota_status_t ota_status, unsigned char error_numbe
         beep(beep_settings);
 
         esp_wifi_disconnect();
-        xSemaphoreGive(chip_sleep_semaphore);
+
+        create_light_sleep_task();
     } else if (ota_status == OTA_OK) {
         beep_setting_t beep_settings = {
             .beep_type = SINGLE_BEEP,
@@ -326,26 +328,48 @@ static void read_temperature_and_apply()
     }
 
     // histeresis calculation
-    if (read_flag(general_flags, STEERING_WHEEL_HEATING_IS_ACTIVE_FLAG)) {
+    /*if (read_flag(general_flags, STEERING_WHEEL_HEATING_IS_ACTIVE_FLAG)) {
         expected_temperature += TEMPERATURE_HISTERESIS;
     } else {
         expected_temperature -= TEMPERATURE_HISTERESIS;
-    }
+    }*/
 
     bool turn_heating_on = temp < expected_temperature;
     gpio_set_level(GPIO_OUTPUT_IO_TRANSISTOR, turn_heating_on);
+
+    if (is_notify_heating_state() &&
+            turn_heating_on != read_flag(general_flags, STEERING_WHEEL_HEATING_IS_ACTIVE_FLAG)) {
+        beep_setting_t beep_settings = {
+            .beep_type = BEEPS,
+            .beeps = 1,
+            .blocking_type = BLOCKING
+        };
+        beep(beep_settings);
+    }
     
     if (turn_heating_on) {
         gpio_hold_en(GPIO_OUTPUT_IO_TRANSISTOR);
-    } else {
-        gpio_hold_dis(GPIO_OUTPUT_IO_TRANSISTOR);
-    }
-
-    if (turn_heating_on) {
         set_flag(&general_flags, STEERING_WHEEL_HEATING_IS_ACTIVE_FLAG);
     } else {
+        gpio_hold_dis(GPIO_OUTPUT_IO_TRANSISTOR);
         reset_flag(&general_flags, STEERING_WHEEL_HEATING_IS_ACTIVE_FLAG);
     }
+}
+
+static void enable_pwm_measurement()
+{
+    if (!read_flag(general_flags, MCPWM_ENABLED_FLAG)) {
+        ESP_ERROR_CHECK(mcpwm_capture_channel_enable(mcpwm_cap_channel_handle));
+        ESP_ERROR_CHECK(mcpwm_capture_timer_enable(mcpwm_cap_timer_handle));
+        ESP_ERROR_CHECK(mcpwm_capture_timer_start(mcpwm_cap_timer_handle));
+
+        set_flag(&general_flags, MCPWM_ENABLED_FLAG);
+    }
+}
+
+static void disable_pwm_measurement()
+{
+    reset_flag(&general_flags, MCPWM_ENABLED_FLAG);
 }
 
 static bool external_led_pwm_callback(mcpwm_cap_channel_handle_t cap_chan, const mcpwm_capture_event_data_t *edata, void *user_data)
@@ -365,7 +389,7 @@ static bool external_led_pwm_callback(mcpwm_cap_channel_handle_t cap_chan, const
         ESP_ERROR_CHECK(mcpwm_capture_timer_stop(mcpwm_cap_timer_handle));
         ESP_ERROR_CHECK(mcpwm_capture_timer_disable(mcpwm_cap_timer_handle));
 
-        reset_flag(&general_flags, MCPWM_ENABLED_FLAG);
+        disable_pwm_measurement();
 
         cap_val_prev = 0;
         callback_counter = 0;
@@ -404,32 +428,99 @@ static void external_led_pwm_config()
     ESP_ERROR_CHECK(mcpwm_capture_channel_register_event_callbacks(mcpwm_cap_channel_handle, &cbs, NULL));
 }
 
-static void wait_gpio_inactive(void)
+static hold_button_status_t wait_gpio_inactive(gpio_num_t gpio_num)
 {
-    while (gpio_get_level(GPIO_WAKEUP_NUM) == GPIO_WAKEUP_LEVEL) {
+    uint32_t button_pressed_time_ms = utils_get_system_timestamp_ms();
+    hold_button_status_t status = HOLD_BUTTON_NO_STATUS;
+    
+    while (gpio_get_level(gpio_num) == GPIO_WAKEUP_LEVEL) {
+        uint32_t hold_time_ms = utils_get_system_timestamp_ms() - button_pressed_time_ms;
+
+        if (hold_time_ms >= 3000 && status == (HOLD_BUTTON_OTA_STATUS - 1)) {
+            status = HOLD_BUTTON_OTA_STATUS;
+
+            beep_setting_t beep_setting = {
+                .beep_type = BEEPS,
+                .beeps = HOLD_BUTTON_OTA_STATUS,
+                .blocking_type = BLOCKING
+            };
+            beep(beep_setting);
+        } else if (hold_time_ms >= 5000 && status == (HOLD_BUTTON_LED_PWM_IGNORED_STATUS - 1)) {
+            status = HOLD_BUTTON_LED_PWM_IGNORED_STATUS;
+
+            beep_setting_t beep_setting = {
+                .beep_type = BEEPS,
+                .beeps = HOLD_BUTTON_LED_PWM_IGNORED_STATUS,
+                .blocking_type = BLOCKING
+            };
+            beep(beep_setting);
+        } else if (hold_time_ms >= 7000 && status == (HOLD_BUTTON_NOTIFY_HEATING_STATUS - 1)) {
+            status = HOLD_BUTTON_NOTIFY_HEATING_STATUS;
+
+            beep_setting_t beep_setting = {
+                .beep_type = BEEPS,
+                .beeps = HOLD_BUTTON_NOTIFY_HEATING_STATUS,
+                .blocking_type = BLOCKING
+            };
+            beep(beep_setting);
+        }
+
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+
+    return status;
 }
 
-static esp_err_t register_gpio_wakeup(void)
+static esp_err_t register_gpio_wakeup()
 {
     /* Initialize GPIO */
     gpio_config_t config = {
-            .pin_bit_mask = BIT64(GPIO_WAKEUP_NUM),
-            .mode = GPIO_MODE_INPUT,
-            .pull_down_en = false,
-            .pull_up_en = false,
-            .intr_type = GPIO_INTR_DISABLE
+        .pin_bit_mask = (BIT64(GPIO_WAKEUP_NUM)),
+        .mode = GPIO_MODE_INPUT,
+        .pull_down_en = false,
+        .pull_up_en = false, // 'false' for steering wheel, 'true' for a development board
+        .intr_type = GPIO_INTR_DISABLE
     };
     ESP_ERROR_CHECK(gpio_config(&config));
 
     /* Enable wake up from GPIO */
     ESP_ERROR_CHECK(gpio_wakeup_enable(GPIO_WAKEUP_NUM, GPIO_WAKEUP_LEVEL == 0 ? GPIO_INTR_LOW_LEVEL : GPIO_INTR_HIGH_LEVEL));
+    
     ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup());
 
     /* Make sure the GPIO is inactive and it won't trigger wakeup immediately */
-    wait_gpio_inactive();
+    wait_gpio_inactive(GPIO_WAKEUP_NUM);
     return ESP_OK;
+}
+
+static void register_rtc_gpio_wakeup()
+{
+    esp_sleep_ext1_wakeup_mode_t ext_wakeup_mode;
+    if (gpio_get_level(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN)) {
+        ext_wakeup_mode = ESP_EXT1_WAKEUP_ANY_LOW;
+    } else {
+        ext_wakeup_mode = ESP_EXT1_WAKEUP_ANY_HIGH;
+    }
+    ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup(BIT64(RTC_GPIO_INPUT_TESLA_PIN_5_UP) | BIT64(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN), ext_wakeup_mode));
+
+#if EXT1_USE_INTERNAL_PULLUPS
+    if (ext_wakeup_mode) {
+        ESP_ERROR_CHECK(rtc_gpio_pullup_dis(RTC_GPIO_INPUT_TESLA_PIN_5_UP));
+        ESP_ERROR_CHECK(rtc_gpio_pulldown_en(RTC_GPIO_INPUT_TESLA_PIN_5_UP));
+        ESP_ERROR_CHECK(rtc_gpio_pullup_dis(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN));
+        ESP_ERROR_CHECK(rtc_gpio_pulldown_en(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN));
+    } else {
+        ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(RTC_GPIO_INPUT_TESLA_PIN_5_UP));
+        ESP_ERROR_CHECK(rtc_gpio_pullup_en(RTC_GPIO_INPUT_TESLA_PIN_5_UP));
+        ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN));
+        ESP_ERROR_CHECK(rtc_gpio_pullup_en(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN));
+    }
+#else
+    ESP_ERROR_CHECK(gpio_pulldown_dis(RTC_GPIO_INPUT_TESLA_PIN_5_UP));
+    ESP_ERROR_CHECK(rtc_gpio_pullup_dis(RTC_GPIO_INPUT_TESLA_PIN_5_UP));
+    ESP_ERROR_CHECK(gpio_pulldown_dis(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN));
+    ESP_ERROR_CHECK(rtc_gpio_pullup_dis(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN));
+#endif // EXT1_USE_INTERNAL_PULLUPS
 }
 
 static void pins_config()
@@ -456,6 +547,22 @@ static void pins_config()
     io_diag_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     io_diag_conf.pull_up_en = GPIO_PULLUP_ENABLE;
     gpio_config(&io_diag_conf);
+
+    gpio_config_t rtc_gpio_conf = {};
+    rtc_gpio_conf.intr_type = GPIO_INTR_DISABLE;
+    rtc_gpio_conf.mode = GPIO_MODE_INPUT;
+    rtc_gpio_conf.pin_bit_mask = (BIT64(RTC_GPIO_INPUT_TESLA_PIN_5_UP) | BIT64(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN));
+    if (EXT1_USE_INTERNAL_PULLUPS) {
+        rtc_gpio_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    } else {
+        rtc_gpio_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    }
+    if (EXT1_USE_INTERNAL_PULLDOWNS) {
+        rtc_gpio_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
+    } else {
+        rtc_gpio_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    }
+    gpio_config(&rtc_gpio_conf);
 }
 
 // ADC Calibration
@@ -559,12 +666,36 @@ static bool diagnostic(void)
     return diagnostic_is_ok;
 }
 
+static void reset_ignore_led_pwm() {
+    reset_flag(&general_flags, LED_PWM_IS_IGNORED_FLAG);
+}
+
+static void ignore_led_pwm() {
+    set_flag(&general_flags, LED_PWM_IS_IGNORED_FLAG);
+}
+
+static bool is_led_pwm_ignored() {
+    return read_flag(general_flags, LED_PWM_IS_IGNORED_FLAG);
+}
+
+static void reset_notify_heating_state() {
+    reset_flag(&general_flags, NOTIFY_HEATING_FLAG);
+}
+
+static void set_notify_heating_state() {
+    set_flag(&general_flags, NOTIFY_HEATING_FLAG);
+}
+
+static bool is_notify_heating_state() {
+    return read_flag(general_flags, NOTIFY_HEATING_FLAG);
+}
+
 static void light_sleep_task(void *args)
 {
     float expected_pwm_led_cycle_sec = 1.0f / (float)EXPECTED_PWM_LED_FREQUENCY_HZ;
     uint32_t time_to_wait_for_pwm_led_measurement_ms = (uint32_t)(2.0f * 1000.0f * (float)PWM_LED_MISURE_CYCLES * expected_pwm_led_cycle_sec);
 
-    bool turning_on = false;
+    bool turning_steering_wheel_on = false;
     
     while (true) {
         xSemaphoreTake(chip_sleep_semaphore, portMAX_DELAY);
@@ -572,8 +703,6 @@ static void light_sleep_task(void *args)
         /* Enter sleep mode */
         esp_light_sleep_start();
         xSemaphoreGive(chip_sleep_semaphore);
-
-        uint32_t button_pressed_time_ms = 0;
 
         /* Determine wake up reason */
         const char* wakeup_reason;
@@ -583,8 +712,20 @@ static void light_sleep_task(void *args)
                 break;
             case ESP_SLEEP_WAKEUP_GPIO:
                 wakeup_reason = "pin";
-                button_pressed_time_ms = utils_get_system_timestamp_ms();
                 break;
+            case ESP_SLEEP_WAKEUP_EXT1:
+                uint64_t wakeup_pin_mask = esp_sleep_get_ext1_wakeup_status();
+                if (wakeup_pin_mask != 0) {
+                    int pin = __builtin_ffsll(wakeup_pin_mask) - 1;
+                    ESP_LOGI(TAG, "Wake up from EXT1 %d. Up: %d", (unsigned int) pin, (unsigned int) gpio_get_level(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN));
+                } else {
+                    ESP_LOGI(TAG, "Wake up from EXT1");
+                }
+
+                vTaskDelay(5 / portTICK_PERIOD_MS);
+                register_rtc_gpio_wakeup();
+
+                continue;
             case ESP_SLEEP_WAKEUP_UART:
                 wakeup_reason = "uart";
                 /* Hang-up for a while to switch and execuse the uart task
@@ -604,11 +745,35 @@ static void light_sleep_task(void *args)
         ESP_LOGI(TAG, "Returned from light sleep, reason: %s", wakeup_reason);
 
         if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) {
-            /* Waiting for the gpio inactive, or the chip will continously trigger wakeup*/
-            wait_gpio_inactive();
+            /*uint64_t wakeup_pin_mask = esp_sleep_get_gpio_wakeup_status();
+            if (wakeup_pin_mask != 0) {
+                int pin = __builtin_ffsll(wakeup_pin_mask) - 1;
+                ESP_LOGI(TAG, "Wake up from GPIO %d", pin);
+            } else {
+                ESP_LOGI(TAG, "Wake up from GPIO");
+            }*/
 
-            if ((utils_get_system_timestamp_ms() - button_pressed_time_ms) >= 3000) {
-                create_ota_task();
+            /* Waiting for the gpio inactive, or the chip will continously trigger wakeup*/
+            hold_button_status_t hold_button_status = wait_gpio_inactive(GPIO_WAKEUP_NUM);
+
+            //esp_sleep_get_ext1_wakeup_status();
+
+            if (hold_button_status == HOLD_BUTTON_OTA_STATUS) {
+                turn_steering_wheel_off();
+                update_software();
+                vTaskDelete(NULL);
+            } else if (hold_button_status == HOLD_BUTTON_LED_PWM_IGNORED_STATUS) {
+                if (is_led_pwm_ignored()) {
+                    reset_ignore_led_pwm();
+                } else {
+                    ignore_led_pwm();
+                }
+            } else if (hold_button_status == HOLD_BUTTON_NOTIFY_HEATING_STATUS) {
+                if (is_notify_heating_state()) {
+                    reset_notify_heating_state();
+                } else {
+                    set_notify_heating_state();
+                }
             } else {
                 if (is_steering_wheel_turned_on()) {
                     turn_steering_wheel_off();
@@ -621,7 +786,7 @@ static void light_sleep_task(void *args)
                     beep(beep_setting);
                 } else {
                     turn_steering_wheel_on();
-                    turning_on = true;
+                    turning_steering_wheel_on = true;
                 }
             }
         }
@@ -630,17 +795,16 @@ static void light_sleep_task(void *args)
             continue;
         }
 
-        if (!read_flag(general_flags, MCPWM_ENABLED_FLAG)) {
-            ESP_ERROR_CHECK(mcpwm_capture_channel_enable(mcpwm_cap_channel_handle));
-            ESP_ERROR_CHECK(mcpwm_capture_timer_enable(mcpwm_cap_timer_handle));
-            ESP_ERROR_CHECK(mcpwm_capture_timer_start(mcpwm_cap_timer_handle));
+        bool led_pwm_ignored = is_led_pwm_ignored();
 
-            set_flag(&general_flags, MCPWM_ENABLED_FLAG);
+        if (!led_pwm_ignored) {
+            enable_pwm_measurement();
         }
         
-        if (xTaskNotifyWait(0x00, ULONG_MAX, NULL, pdMS_TO_TICKS(time_to_wait_for_pwm_led_measurement_ms)) == pdTRUE) {
-            if (is_tesla_led_turned_on()) {
-                if (turning_on) {
+        if (led_pwm_ignored ||
+                xTaskNotifyWait(0x00, ULONG_MAX, NULL, pdMS_TO_TICKS(time_to_wait_for_pwm_led_measurement_ms)) == pdTRUE) {
+            if (led_pwm_ignored || is_tesla_led_turned_on()) {
+                if (turning_steering_wheel_on) {
                     beep_setting_t beep_setting = {
                         .beep_type = BEEPS,
                         .beeps = 1,
@@ -648,8 +812,8 @@ static void light_sleep_task(void *args)
                     };
                     beep(beep_setting);
 
-                    turning_on = false;
-                }
+                    turning_steering_wheel_on = false;
+                }    
             } else {
                 turn_steering_wheel_off();
                 continue;
@@ -661,6 +825,10 @@ static void light_sleep_task(void *args)
 
         read_temperature_and_apply();
     }
+}
+
+static void create_light_sleep_task() {
+    xTaskCreate(light_sleep_task, "light_sleep", 4 * 1024, NULL, 2, &light_sleep_task_handle);
 }
 
 void app_main(void)
@@ -689,6 +857,7 @@ void app_main(void)
     pins_config();
     external_led_pwm_config();
     register_gpio_wakeup();
+    register_rtc_gpio_wakeup();
 
     const esp_partition_t *running = esp_ota_get_running_partition();
     esp_ota_img_states_t ota_state;
@@ -720,9 +889,9 @@ void app_main(void)
     ESP_ERROR_CHECK(err);
 
     beep_setting_t beep_setting = {
-        .beep_type = BEEPS,
-        .beeps = 1,
-        .blocking_type = BLOCKING
+        .beep_type = SINGLE_BEEP,
+        .blocking_type = BLOCKING,
+        .single_beep_duration_ms = 500
     };
     beep(beep_setting);
 
@@ -742,5 +911,5 @@ void app_main(void)
     chip_sleep_semaphore = xSemaphoreCreateBinary();
     xSemaphoreGive(chip_sleep_semaphore);
 
-    xTaskCreate(light_sleep_task, "light_sleep", 4 * 1024, NULL, 2, &light_sleep_task_handle);
+    create_light_sleep_task();
 }
