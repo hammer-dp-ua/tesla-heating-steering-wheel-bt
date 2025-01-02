@@ -32,6 +32,7 @@
 #define LED_PWM_IS_IGNORED_FLAG                 16
 #define MCPWM_ENABLED_FLAG                      32
 #define NOTIFY_HEATING_FLAG                     64
+#define SCROLL_TRIGGERED_FLAG                   128 // There are 2 triggers on 1 scroll click
 
 #define TEMPERATURE_SENSOR_ADC1_CHANNEL ADC_CHANNEL_2 // GPIO3
 

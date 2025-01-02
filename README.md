@@ -1,6 +1,6 @@
 # Tesla M3 2018 heating steering wheel using ESP32 S3
 
-esp-idf: v5.1.2 stable
+esp-idf: v5.3.2 stable
 
 Original M3 2018 steering wheel was replaced by 2021 M3/MY from Tesla restyle.
 

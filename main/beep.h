@@ -1,7 +1,7 @@
 #include "freertos/semphr.h"
 #include "esp_pm.h"
 
-#define BUZZER_PIN GPIO_NUM_18
+#define BUZZER_PIN GPIO_NUM_20
 
 typedef enum {
     BLOCKING,

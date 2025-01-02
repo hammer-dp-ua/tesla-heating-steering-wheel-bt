@@ -200,30 +200,28 @@ static void increase_heating_temperature()
 {
     if (heating_temperature < HEATING_TEMP_HIGH) {
         heating_temperature++;
-    }
 
-    beep_setting_t beep_settings = {
-        .beep_type = BEEPS,
-        .beeps = heating_temperature,
-        .blocking_type = NON_BLOCKING,
-        .chip_sleep_semaphore = chip_sleep_semaphore
-    };
-    beep(beep_settings);
+        beep_setting_t beep_settings = {
+            .beep_type = BEEPS,
+            .beeps = heating_temperature,
+            .blocking_type = BLOCKING
+        };
+        beep(beep_settings);
+    }
 }
 
 static void decrease_heating_temperature()
 {
     if (heating_temperature > HEATING_TEMP_LOW) {
         heating_temperature--;
-    }
 
-    beep_setting_t beep_settings = {
-        .beep_type = BEEPS,
-        .beeps = heating_temperature,
-        .blocking_type = NON_BLOCKING,
-        .chip_sleep_semaphore = chip_sleep_semaphore
-    };
-    beep(beep_settings);
+        beep_setting_t beep_settings = {
+            .beep_type = BEEPS,
+            .beeps = heating_temperature,
+            .blocking_type = BLOCKING
+        };
+        beep(beep_settings);
+    }
 }
 
 static void turn_steering_wheel_off()
@@ -493,34 +491,73 @@ static esp_err_t register_gpio_wakeup()
     return ESP_OK;
 }
 
-static void register_rtc_gpio_wakeup()
+static bool register_rtc_gpio_wakeup(gpio_num_t pins[], unsigned char pins_amount)
 {
+    /*for (unsigned char i = 0; i < pins_amount; i++) {
+        ESP_LOGI(TAG, "rtc_gpio_get_level: %d", (int) rtc_gpio_get_level(pins[i]));
+    }*/
+
+    if (pins_amount > 1) {
+        uint32_t first_pin_level = rtc_gpio_get_level(pins[0]);
+
+        for (unsigned char i = 1; i < pins_amount; i++) {
+            if (first_pin_level != rtc_gpio_get_level(pins[i])) {
+                return false;
+            }
+        }
+    }
+    
     esp_sleep_ext1_wakeup_mode_t ext_wakeup_mode;
-    if (gpio_get_level(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN)) {
+
+    if (rtc_gpio_get_level(pins[0])) {
         ext_wakeup_mode = ESP_EXT1_WAKEUP_ANY_LOW;
     } else {
         ext_wakeup_mode = ESP_EXT1_WAKEUP_ANY_HIGH;
     }
-    ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup(BIT64(RTC_GPIO_INPUT_TESLA_PIN_5_UP) | BIT64(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN), ext_wakeup_mode));
 
-#if EXT1_USE_INTERNAL_PULLUPS
-    if (ext_wakeup_mode) {
-        ESP_ERROR_CHECK(rtc_gpio_pullup_dis(RTC_GPIO_INPUT_TESLA_PIN_5_UP));
-        ESP_ERROR_CHECK(rtc_gpio_pulldown_en(RTC_GPIO_INPUT_TESLA_PIN_5_UP));
-        ESP_ERROR_CHECK(rtc_gpio_pullup_dis(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN));
-        ESP_ERROR_CHECK(rtc_gpio_pulldown_en(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN));
-    } else {
-        ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(RTC_GPIO_INPUT_TESLA_PIN_5_UP));
-        ESP_ERROR_CHECK(rtc_gpio_pullup_en(RTC_GPIO_INPUT_TESLA_PIN_5_UP));
-        ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN));
-        ESP_ERROR_CHECK(rtc_gpio_pullup_en(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN));
+    uint64_t pins_mask = 0;
+    for (unsigned char i = 0; i < pins_amount; i++) {
+        pins_mask |= BIT64(pins[i]);
     }
-#else
-    ESP_ERROR_CHECK(gpio_pulldown_dis(RTC_GPIO_INPUT_TESLA_PIN_5_UP));
-    ESP_ERROR_CHECK(rtc_gpio_pullup_dis(RTC_GPIO_INPUT_TESLA_PIN_5_UP));
-    ESP_ERROR_CHECK(gpio_pulldown_dis(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN));
-    ESP_ERROR_CHECK(rtc_gpio_pullup_dis(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN));
+    //ESP_LOGI(TAG, "pins_mask: %d", (unsigned int)pins_mask);
+    ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup(pins_mask, ext_wakeup_mode));
+    
+/* If there are no external pull-up/downs, tie wakeup pins to inactive level with internal pull-up/downs via RTC IO
+ * during deepsleep. However, RTC IO relies on the RTC_PERIPH power domain. Keeping this power domain on will
+ * increase some power comsumption. However, if we turn off the RTC_PERIPH domain or if certain chips lack the RTC_PERIPH
+ * domain, we will use the HOLD feature to maintain the pull-up and pull-down on the pins during sleep.*/
+#if EXT1_USE_INTERNAL_PULLUPS
+#if SOC_RTCIO_INPUT_OUTPUT_SUPPORTED
+    for (unsigned char i = 0; i < pins_amount; i++) {
+        gpio_num_t pin = pins[i];
+
+        // For dev board:
+        /*if (ext_wakeup_mode) {
+            ESP_ERROR_CHECK(rtc_gpio_pullup_dis(pin));
+            ESP_ERROR_CHECK(rtc_gpio_pulldown_en(pin));
+        } else {
+            ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(pin));
+            ESP_ERROR_CHECK(rtc_gpio_pullup_en(pin));
+        }*/
+
+       ESP_ERROR_CHECK(rtc_gpio_pullup_dis(pin));
+       ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(pin));
+    }
+#else // SOC_RTCIO_INPUT_OUTPUT_SUPPORTED
+    for (unsigned char i = 0; i < pins_amount; i++) {
+        gpio_num_t pin = pins[i];
+
+        if (ext_wakeup_mode) {
+            ESP_ERROR_CHECK(gpio_pullup_dis(pin));
+            ESP_ERROR_CHECK(gpio_pulldown_en(pin));
+        } else {
+            ESP_ERROR_CHECK(gpio_pulldown_dis(pin));
+            ESP_ERROR_CHECK(gpio_pullup_en(pin));
+        }
+    }
+#endif
 #endif // EXT1_USE_INTERNAL_PULLUPS
+    return true;
 }
 
 static void pins_config()
@@ -552,16 +589,8 @@ static void pins_config()
     rtc_gpio_conf.intr_type = GPIO_INTR_DISABLE;
     rtc_gpio_conf.mode = GPIO_MODE_INPUT;
     rtc_gpio_conf.pin_bit_mask = (BIT64(RTC_GPIO_INPUT_TESLA_PIN_5_UP) | BIT64(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN));
-    if (EXT1_USE_INTERNAL_PULLUPS) {
-        rtc_gpio_conf.pull_up_en = GPIO_PULLUP_ENABLE;
-    } else {
-        rtc_gpio_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-    }
-    if (EXT1_USE_INTERNAL_PULLDOWNS) {
-        rtc_gpio_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
-    } else {
-        rtc_gpio_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    }
+    rtc_gpio_conf.pull_up_en = GPIO_PULLUP_DISABLE; //EXT1_USE_INTERNAL_PULLUPS ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE;
+    rtc_gpio_conf.pull_down_en = GPIO_PULLDOWN_DISABLE; //EXT1_USE_INTERNAL_PULLDOWNS ? GPIO_PULLDOWN_ENABLE : GPIO_PULLDOWN_DISABLE;
     gpio_config(&rtc_gpio_conf);
 }
 
@@ -690,6 +719,17 @@ static bool is_notify_heating_state() {
     return read_flag(general_flags, NOTIFY_HEATING_FLAG);
 }
 
+static void configure_scroll_pins() {
+    gpio_num_t rtc_pins[] = {RTC_GPIO_INPUT_TESLA_PIN_5_UP, RTC_GPIO_INPUT_TESLA_PIN_6_DOWN};
+    bool configured = register_rtc_gpio_wakeup(rtc_pins, 2);
+
+    if (configured) {
+        reset_flag(&general_flags, SCROLL_TRIGGERED_FLAG);
+    } else {
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+    }
+}
+
 static void light_sleep_task(void *args)
 {
     float expected_pwm_led_cycle_sec = 1.0f / (float)EXPECTED_PWM_LED_FREQUENCY_HZ;
@@ -706,7 +746,8 @@ static void light_sleep_task(void *args)
 
         /* Determine wake up reason */
         const char* wakeup_reason;
-        switch (esp_sleep_get_wakeup_cause()) {
+        esp_sleep_wakeup_cause_t esp_sleep_wakeup_cause = esp_sleep_get_wakeup_cause();
+        switch (esp_sleep_wakeup_cause) {
             case ESP_SLEEP_WAKEUP_TIMER:
                 wakeup_reason = "timer";
                 break;
@@ -715,15 +756,51 @@ static void light_sleep_task(void *args)
                 break;
             case ESP_SLEEP_WAKEUP_EXT1:
                 uint64_t wakeup_pin_mask = esp_sleep_get_ext1_wakeup_status();
+                
                 if (wakeup_pin_mask != 0) {
                     int pin = __builtin_ffsll(wakeup_pin_mask) - 1;
-                    ESP_LOGI(TAG, "Wake up from EXT1 %d. Up: %d", (unsigned int) pin, (unsigned int) gpio_get_level(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN));
+                    unsigned int pin_level = rtc_gpio_get_level(pin);
+
+                    if (read_flag(general_flags, SCROLL_TRIGGERED_FLAG)) {
+                        configure_scroll_pins();
+
+                        if (is_steering_wheel_turned_on()) {
+                            if (pin == RTC_GPIO_INPUT_TESLA_PIN_6_DOWN) {
+                                increase_heating_temperature();
+                            } else if (pin == RTC_GPIO_INPUT_TESLA_PIN_5_UP) {
+                                decrease_heating_temperature();
+                            }
+                        }
+
+                        /*beep_setting_t beep_setting = {
+                            .beep_type = SINGLE_BEEP,
+                            .blocking_type = BLOCKING,
+                            .single_beep_duration_ms = 500
+                        };
+                        beep(beep_setting);
+
+                        ESP_LOGI(TAG, "beep");*/
+                    } else {
+                        set_flag(&general_flags, SCROLL_TRIGGERED_FLAG);
+
+                        if (pin == RTC_GPIO_INPUT_TESLA_PIN_5_UP) {
+                            gpio_num_t rtc_pins[] = {RTC_GPIO_INPUT_TESLA_PIN_6_DOWN};
+                            register_rtc_gpio_wakeup(rtc_pins, 1);
+                        } else if (pin == RTC_GPIO_INPUT_TESLA_PIN_6_DOWN) {
+                            gpio_num_t rtc_pins[] = {RTC_GPIO_INPUT_TESLA_PIN_5_UP};
+                            register_rtc_gpio_wakeup(rtc_pins, 1);
+                        }
+                    }
+
+                    //ESP_LOGI(TAG, "Wake up from EXT1 %d. Level: %d", (unsigned int) pin, pin_level);
                 } else {
-                    ESP_LOGI(TAG, "Wake up from EXT1");
+                    configure_scroll_pins();
+
+                    //ESP_LOGI(TAG, "Wake up from EXT1");
                 }
 
-                vTaskDelay(5 / portTICK_PERIOD_MS);
-                register_rtc_gpio_wakeup();
+                //rtc_gpio_deinit(RTC_GPIO_INPUT_TESLA_PIN_5_UP);
+                //rtc_gpio_deinit(RTC_GPIO_INPUT_TESLA_PIN_6_DOWN);
 
                 continue;
             case ESP_SLEEP_WAKEUP_UART:
@@ -739,12 +816,18 @@ static void light_sleep_task(void *args)
 #endif
             default:
                 wakeup_reason = "other";
+                
+                configure_scroll_pins();
                 break;
         }
 
-        ESP_LOGI(TAG, "Returned from light sleep, reason: %s", wakeup_reason);
-
-        if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) {
+        /*if (esp_sleep_wakeup_cause) {
+            ESP_LOGI(TAG, "Returned from light sleep, reason: %s. Wakeup cause: %d.", wakeup_reason, (unsigned int) esp_sleep_wakeup_cause);
+        } else {
+            printf(".");
+        }*/
+    
+        if (esp_sleep_wakeup_cause == ESP_SLEEP_WAKEUP_GPIO) {
             /*uint64_t wakeup_pin_mask = esp_sleep_get_gpio_wakeup_status();
             if (wakeup_pin_mask != 0) {
                 int pin = __builtin_ffsll(wakeup_pin_mask) - 1;
@@ -833,6 +916,8 @@ static void create_light_sleep_task() {
 
 void app_main(void)
 {
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
+    
     uint8_t sha_256[HASH_LEN] = { 0 };
     esp_partition_t partition;
 
@@ -857,7 +942,8 @@ void app_main(void)
     pins_config();
     external_led_pwm_config();
     register_gpio_wakeup();
-    register_rtc_gpio_wakeup();
+
+    configure_scroll_pins();
 
     const esp_partition_t *running = esp_ota_get_running_partition();
     esp_ota_img_states_t ota_state;
@@ -888,12 +974,12 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
-    beep_setting_t beep_setting = {
+    /*beep_setting_t beep_setting = {
         .beep_type = SINGLE_BEEP,
         .blocking_type = BLOCKING,
         .single_beep_duration_ms = 500
     };
-    beep(beep_setting);
+    beep(beep_setting);*/
 
     adc_init();
     
