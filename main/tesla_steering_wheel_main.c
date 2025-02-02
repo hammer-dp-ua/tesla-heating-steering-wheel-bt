@@ -49,7 +49,9 @@ static uint32_t general_flags = 0;
 
 static adc_oneshot_unit_handle_t adc1_handle = NULL;
 static adc_cali_handle_t adc_cali_temperature_sensor_handle = NULL;
+static adc_cali_handle_t adc_cali_tesla_led_pwm_handle = NULL;
 static bool do_calibration_temperature_sensor = false;
+static bool do_calibration_tesla_led_pwm = false;
 
 static uint32_t external_led_pwm_ticks = 0;
 
@@ -243,18 +245,21 @@ static bool is_steering_wheel_turned_on()
     return read_flag(general_flags, STEERING_WHEEL_IS_TURNED_ON_FLAG);
 }
 
-static uint32_t get_pwm_frequency(uint32_t pwm_ticks)
+/*static uint32_t get_pwm_frequency(uint32_t pwm_ticks)
 {
     uint32_t processor_frequency = (uint32_t)esp_clk_apb_freq();
     return (pwm_ticks > 0 && processor_frequency > pwm_ticks)
             ? (uint32_t)(processor_frequency / pwm_ticks)
             : 0;
-}
+}*/
 
 static bool is_tesla_led_turned_on()
 {
-    uint32_t pwm_frequency = get_pwm_frequency(external_led_pwm_ticks);
-    return pwm_frequency > (EXPECTED_PWM_LED_FREQUENCY_HZ - 50) && pwm_frequency < (EXPECTED_PWM_LED_FREQUENCY_HZ + 50);
+    //uint32_t pwm_frequency = get_pwm_frequency(external_led_pwm_ticks);
+    //return pwm_frequency > (EXPECTED_PWM_LED_FREQUENCY_HZ - 50) && pwm_frequency < (EXPECTED_PWM_LED_FREQUENCY_HZ + 50);
+    uint32_t voltage_mv =
+            read_adc_voltage(TESLA_LED_PWM_ADC1_CHANNEL, adc_cali_tesla_led_pwm_handle, do_calibration_tesla_led_pwm);
+    return voltage_mv > 250; // Actual measured value at 15V was 330mV
 }
 
 static float calculate_ntc_temperature(float temp_sensor_resistance)
@@ -285,11 +290,11 @@ static uint32_t read_adc_voltage(adc_channel_t adc_channel, adc_cali_handle_t ad
             voltage_accumulator += voltage;
         }
     
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+        vTaskDelay(5 / portTICK_PERIOD_MS);
     }
     
     uint32_t voltage_avarage_mv = voltage_accumulator / ADC_SAMPLES;
-    ESP_LOGI(TAG, "ADC calibration Voltage: %d mV", (unsigned int)voltage_avarage_mv);
+    //ESP_LOGI(TAG, "ADC calibration Voltage: %d mV", (unsigned int)voltage_avarage_mv);
     return voltage_avarage_mv;
 }
 
@@ -303,11 +308,11 @@ static void read_temperature_and_apply()
     float current = series_resistor_voltage / TEMPERATURE_SENSOR_SERIES_RESISTOR;
     float temp_sensor_resistance = (TEMPERATURE_SENSOR_V_REF - series_resistor_voltage) / current;
 
-    ESP_LOGI(TAG, "Temperature sensor resistance: %f Ohms", temp_sensor_resistance);
+    //ESP_LOGI(TAG, "Temperature sensor resistance: %f Ohms", temp_sensor_resistance);
 
     float temp = calculate_ntc_temperature(temp_sensor_resistance);
 
-    ESP_LOGI(TAG, "Temperature: %f C", temp);
+    //ESP_LOGI(TAG, "Temperature: %f C", temp);
 
     float expected_temperature = 0.0f;
     switch (heating_temperature)
@@ -354,7 +359,7 @@ static void read_temperature_and_apply()
     }
 }
 
-static void enable_pwm_measurement()
+/*static void enable_pwm_measurement()
 {
     if (!read_flag(general_flags, MCPWM_ENABLED_FLAG)) {
         ESP_ERROR_CHECK(mcpwm_capture_channel_enable(mcpwm_cap_channel_handle));
@@ -368,9 +373,9 @@ static void enable_pwm_measurement()
 static void disable_pwm_measurement()
 {
     reset_flag(&general_flags, MCPWM_ENABLED_FLAG);
-}
+}*/
 
-static bool external_led_pwm_callback(mcpwm_cap_channel_handle_t cap_chan, const mcpwm_capture_event_data_t *edata, void *user_data)
+/*static bool external_led_pwm_callback(mcpwm_cap_channel_handle_t cap_chan, const mcpwm_capture_event_data_t *edata, void *user_data)
 {
     static uint32_t cap_val_prev = 0;
     static unsigned char callback_counter = 0;
@@ -396,9 +401,9 @@ static bool external_led_pwm_callback(mcpwm_cap_channel_handle_t cap_chan, const
     }
     
     return task_wakeup == pdTRUE;
-}
+}*/
 
-static void external_led_pwm_config()
+/*static void external_led_pwm_config()
 {
     // Install capture timer
     mcpwm_capture_timer_config_t cap_conf = {
@@ -424,7 +429,7 @@ static void external_led_pwm_config()
         .on_cap = external_led_pwm_callback
     };
     ESP_ERROR_CHECK(mcpwm_capture_channel_register_event_callbacks(mcpwm_cap_channel_handle, &cbs, NULL));
-}
+}*/
 
 static hold_button_status_t wait_gpio_inactive(gpio_num_t gpio_num)
 {
@@ -603,7 +608,7 @@ static bool adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_att
 
 #if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
     if (!calibrated) {
-        ESP_LOGI(TAG, "Calibration scheme version is %s", "Curve Fitting");
+        //ESP_LOGI(TAG, "Calibration scheme version is %s", "Curve Fitting");
 
         adc_cali_curve_fitting_config_t cali_config = {
             .unit_id = unit,
@@ -637,7 +642,7 @@ static bool adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_att
 
     *out_handle = handle;
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Calibration success");
+        //ESP_LOGI(TAG, "Calibration success");
     } else if (ret == ESP_ERR_NOT_SUPPORTED || !calibrated) {
         ESP_LOGW(TAG, "eFuse not burnt, skip software calibration");
     } else {
@@ -662,9 +667,11 @@ static void adc_init()
     };
 
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, TEMPERATURE_SENSOR_ADC1_CHANNEL, &config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, TESLA_LED_PWM_ADC1_CHANNEL, &config));
 
     //-------------ADC1 Calibration Init---------------//
     do_calibration_temperature_sensor = adc_calibration_init(ADC_UNIT_1, TEMPERATURE_SENSOR_ADC1_CHANNEL, ADC_ATTEN, &adc_cali_temperature_sensor_handle);
+    do_calibration_tesla_led_pwm = adc_calibration_init(ADC_UNIT_1, TESLA_LED_PWM_ADC1_CHANNEL, ADC_ATTEN, &adc_cali_tesla_led_pwm_handle);
 }
 
 // Enable configUSE_TRACE_FACILITY, configUSE_STATS_FORMATTING_FUNCTIONS, xCoreID
@@ -732,8 +739,8 @@ static void configure_scroll_pins() {
 
 static void light_sleep_task(void *args)
 {
-    float expected_pwm_led_cycle_sec = 1.0f / (float)EXPECTED_PWM_LED_FREQUENCY_HZ;
-    uint32_t time_to_wait_for_pwm_led_measurement_ms = (uint32_t)(2.0f * 1000.0f * (float)PWM_LED_MISURE_CYCLES * expected_pwm_led_cycle_sec);
+    //float expected_pwm_led_cycle_sec = 1.0f / (float)EXPECTED_PWM_LED_FREQUENCY_HZ;
+    //uint32_t time_to_wait_for_pwm_led_measurement_ms = (uint32_t)(2.0f * 1000.0f * (float)PWM_LED_MISURE_CYCLES * expected_pwm_led_cycle_sec);
 
     bool turning_steering_wheel_on = false;
     
@@ -880,31 +887,27 @@ static void light_sleep_task(void *args)
 
         bool led_pwm_ignored = is_led_pwm_ignored();
 
-        if (!led_pwm_ignored) {
+        /*if (!led_pwm_ignored) {
             enable_pwm_measurement();
-        }
+        }*/
         
-        if (led_pwm_ignored ||
-                xTaskNotifyWait(0x00, ULONG_MAX, NULL, pdMS_TO_TICKS(time_to_wait_for_pwm_led_measurement_ms)) == pdTRUE) {
-            if (led_pwm_ignored || is_tesla_led_turned_on()) {
-                if (turning_steering_wheel_on) {
-                    beep_setting_t beep_setting = {
-                        .beep_type = BEEPS,
-                        .beeps = 1,
-                        .blocking_type = BLOCKING
-                    };
-                    beep(beep_setting);
-
-                    turning_steering_wheel_on = false;
-                }    
-            } else {
-                turn_steering_wheel_off();
-                continue;
+        //if (led_pwm_ignored || xTaskNotifyWait(0x00, ULONG_MAX, NULL, pdMS_TO_TICKS(time_to_wait_for_pwm_led_measurement_ms)) == pdTRUE) {
+        if (led_pwm_ignored || is_tesla_led_turned_on()) {
+            if (turning_steering_wheel_on) {
+                beep_setting_t beep_setting = {
+                    .beep_type = BEEPS,
+                    .beeps = 1,
+                    .blocking_type = BLOCKING
+                };
+                beep(beep_setting);
             }
         } else {
             turn_steering_wheel_off();
+            turning_steering_wheel_on = false;
             continue;
         }
+
+        turning_steering_wheel_on = false;
 
         read_temperature_and_apply();
     }
@@ -940,7 +943,7 @@ void app_main(void)
     print_sha256(sha_256, "SHA-256 for current firmware: ");
 
     pins_config();
-    external_led_pwm_config();
+    //external_led_pwm_config();
     register_gpio_wakeup();
 
     configure_scroll_pins();

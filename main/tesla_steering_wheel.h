@@ -30,14 +30,15 @@
 #define WIFI_CONNECTED_FLAG                     4
 #define WIFI_INITIALIZED_FLAG                   8
 #define LED_PWM_IS_IGNORED_FLAG                 16
-#define MCPWM_ENABLED_FLAG                      32
+//#define MCPWM_ENABLED_FLAG                      32
 #define NOTIFY_HEATING_FLAG                     64
 #define SCROLL_TRIGGERED_FLAG                   128 // There are 2 triggers on 1 scroll click
 
 #define TEMPERATURE_SENSOR_ADC1_CHANNEL ADC_CHANNEL_2 // GPIO3
+#define TESLA_LED_PWM_ADC1_CHANNEL      ADC_CHANNEL_9 // GPIO10
 
 #define ADC_ATTEN ADC_ATTEN_DB_0 // Atten = 0, effective measurement range of 100 ∼ 950 mV
-#define ADC_SAMPLES 20
+#define ADC_SAMPLES 10
 #define TEMPERATURE_SENSOR_SERIES_RESISTOR  1500.0f // Ohms
 #define TEMPERATURE_SENSOR_V_REF            3.3f // V
 #define TEMPERATURE_SENSOR_NTC_R_NOMINAL    10000.0f
@@ -48,8 +49,8 @@
 
 #define TIMER_WAKEUP_TIME_US (2 * 1000 * 1000)
 
-#define EXPECTED_PWM_LED_FREQUENCY_HZ 250
-#define PWM_LED_MISURE_CYCLES 10
+//#define EXPECTED_PWM_LED_FREQUENCY_HZ 250
+//#define PWM_LED_MISURE_CYCLES 10
 
 typedef enum {
     HEATING_TEMP_LOW = 1,
@@ -71,3 +72,4 @@ static void reset_notify_heating_state();
 static void set_notify_heating_state();
 static bool is_notify_heating_state();
 static void create_light_sleep_task();
+static uint32_t read_adc_voltage(adc_channel_t adc_channel, adc_cali_handle_t adc_cali_handle, bool do_calibration);
